@@ -17,6 +17,7 @@
 import os
 import torch
 import ctypes
+import time
 from dlio_benchmark.checkpointing.base_checkpointing import BaseCheckpointing
 from dlio_benchmark.utils.utility import Profile, dft_ai
 
@@ -71,6 +72,7 @@ class PyTorchCheckpointing(BaseCheckpointing):
         else:
             return torch.ones(length, dtype=torch_dtype)
 
+    @dlp.log
     def set_madvise_mergeable(self, tensor):
         """
         Apply MADV_MERGEABLE to a PyTorch tensor's memory region with alignment handling.

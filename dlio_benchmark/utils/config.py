@@ -1103,6 +1103,17 @@ def LoadConfig(args, config):
             if 'await_time' in config['checkpoint']['ksm']:
                 args.ksm_await_time = config['checkpoint']['ksm']['await_time']
 
+        if 'ksm' in config['checkpoint']:
+            args.ksm_present = True
+            if 'madv_mergeable_id' in config['checkpoint']['ksm']:
+                args.ksm_madv_mergeable_id = config['checkpoint']['ksm']['madv_mergeable_id']
+            if 'high_ram_trigger' in config['checkpoint']['ksm']:
+                args.ksm_high_ram_trigger = config['checkpoint']['ksm']['high_ram_trigger']
+            if 'low_ram_exit' in config['checkpoint']['ksm']:
+                args.ksm_low_ram_exit = config['checkpoint']['ksm']['low_ram_exit']
+            if 'await_time' in config['checkpoint']['ksm']:
+                args.ksm_await_time = config['checkpoint']['ksm']['await_time']
+
     if 'model' in config:
         if 'name' in config['model']:
             args.model = config['model']['name']
