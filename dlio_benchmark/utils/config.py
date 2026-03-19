@@ -992,6 +992,14 @@ def LoadConfig(args, config):
             args.storage_root = config['storage']['storage_root']
         if 'storage_options' in config['storage']:
             args.storage_options = config['storage']['storage_options']
+        # storage.storage_library lives at the top-level of the storage section,
+        # not nested inside storage_options.  Inject it into storage_options here
+        # so that storage backends can find it via storage_options.get("storage_library")
+        # without reading raw environment variables.
+        if 'storage_library' in config['storage']:
+            if args.storage_options is None:
+                args.storage_options = {}
+            args.storage_options['storage_library'] = config['storage']['storage_library']
 
     # dataset related settings
     if 'dataset' in config:

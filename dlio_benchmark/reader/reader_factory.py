@@ -69,6 +69,10 @@ class ReaderFactory(object):
                     return NPYReaderODirect(dataset_type, thread_index, epoch_number)
                 # Use S3 readers for both S3 and AIStore
                 elif _args.storage_type in (StorageType.S3, StorageType.AISTORE):
+                    storage_library = (getattr(_args, "storage_options", {}) or {}).get("storage_library")
+                    if storage_library in ("s3dlio", "s3torchconnector", "minio"):
+                        from dlio_benchmark.reader.npy_reader_s3_iterable import NPYReaderS3Iterable
+                        return NPYReaderS3Iterable(dataset_type, thread_index, epoch_number)
                     from dlio_benchmark.reader.npy_reader_s3 import NPYReaderS3
                     return NPYReaderS3(dataset_type, thread_index, epoch_number)
                 else:
@@ -83,6 +87,10 @@ class ReaderFactory(object):
                     return NPZReaderODIRECT(dataset_type, thread_index, epoch_number)         
                 # Use S3 readers for both S3 and AIStore
                 elif _args.storage_type in (StorageType.S3, StorageType.AISTORE):
+                    storage_library = (getattr(_args, "storage_options", {}) or {}).get("storage_library")
+                    if storage_library in ("s3dlio", "s3torchconnector", "minio"):
+                        from dlio_benchmark.reader.npz_reader_s3_iterable import NPZReaderS3Iterable
+                        return NPZReaderS3Iterable(dataset_type, thread_index, epoch_number)
                     from dlio_benchmark.reader.npz_reader_s3 import NPZReaderS3
                     return NPZReaderS3(dataset_type, thread_index, epoch_number)
                 else:
@@ -115,6 +123,12 @@ class ReaderFactory(object):
             else:
                 from dlio_benchmark.reader.synthetic_reader import SyntheticReader
                 return SyntheticReader(dataset_type, thread_index, epoch_number)
+        elif type == FormatType.PARQUET:
+            if _args.odirect == True:
+                raise Exception("O_DIRECT for %s format is not yet supported." %type)
+            else:
+                from dlio_benchmark.reader.parquet_reader_s3_iterable import ParquetReaderS3Iterable
+                return ParquetReaderS3Iterable(dataset_type, thread_index, epoch_number)
 
         else:
             raise Exception("Loading data of %s format is not supported without framework data loader" %type)

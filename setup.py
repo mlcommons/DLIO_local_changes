@@ -51,6 +51,9 @@ extras = {
     "aistore": [
         "aistore",
     ],
+    "parquet": [
+        "pyarrow>=12.0.0",
+    ],
 }
 
 here = pathlib.Path(__file__).parent.resolve()
@@ -58,7 +61,7 @@ long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="dlio_benchmark",
-    version="2.0.0",
+    version="3.0.0",
     description="An I/O benchmark for deep learning applications",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -70,7 +73,7 @@ setup(
         #   3 - Alpha
         #   4 - Beta
         #   5 - Production/Stable
-        "Development Status :: 5 - Production/Stable",
+        "Development Status :: 4 - Beta",
         # Indicate who your project is intended for
         "Intended Audience :: Science/Research",
         "Topic :: Software Development :: Build Tools",
