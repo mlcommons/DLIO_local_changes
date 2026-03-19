@@ -191,7 +191,8 @@ class DLIOBenchmark(object):
                     fullpaths = self.storage.walk_node(
                         os.path.join(self.args.data_folder, f"{dataset_type}/*/*.{self.args.format}"),
                         use_pattern=True)
-                    idx = np.argsort(fullpaths)
+                    files = [self.storage.get_basename(f) for f in fullpaths]
+                    idx = np.argsort(files)
                     fullpaths = [fullpaths[i] for i in idx]
                     self.logger.debug(f"fullpaths {fullpaths}")
                 else:
@@ -330,8 +331,6 @@ class DLIOBenchmark(object):
             if overall_step > max_steps or ((self.total_training_steps > 0) and (overall_step > self.total_training_steps)):
                 if self.args.my_rank == 0:
                     self.logger.info(f"{utcnow()} Maximum number of steps reached")
-                if (block_step != 1 and self.do_checkpoint) or (not self.do_checkpoint):
-                    self.stats.end_block(epoch, block, block_step - 1)
                 break
             self.stats.batch_loaded(epoch, overall_step, block)
             computation_time = self.args.computation_time
@@ -360,9 +359,11 @@ class DLIOBenchmark(object):
                 self.stats.start_block(epoch, block)
             self.stats.start_loading()
 
+        # Always closes the current block. It is safe to call end_block for already ended block, as there's a guard inside.
+        self.stats.end_block(epoch, block, block_step - 1)
+
         self.comm.barrier()
         if self.do_checkpoint and (self.steps_between_checkpoints < 0) and (epoch == self.next_checkpoint_epoch):
-            self.stats.end_block(epoch, block, block_step-1)
             self.stats.start_save_ckpt(epoch, block, overall_step-1)
             self.checkpointing_mechanism.save_checkpoint(epoch, overall_step)
             self.stats.end_save_ckpt(epoch, block)

@@ -26,7 +26,7 @@ class Namespace:
 class DataStorage(ABC):
     def __init__(self, framework=None):
         self._args = ConfigArguments.get_instance()
-        self.logger = self._args.logger
+        self.logger = self._args.logger  # dpsi compatibility: add logger property
         if framework is not None:
             self.framework = FrameworkFactory().get_framework(self._args.framework, profiling=False)
             self.is_framework_nativeio_available = self.framework.is_nativeio_available()
@@ -131,3 +131,9 @@ class DataStorage(ABC):
         if self.is_framework_nativeio_available:
             return self.framework.isfile(id)
         return None
+
+    def islocalfs(self):
+        """
+        Method return true if the storage can operate on the files locally
+        """
+        return False

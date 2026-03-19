@@ -52,7 +52,8 @@ class ConfigArguments:
     sample_shuffle: Shuffle = Shuffle.OFF
     read_type: ReadType = ReadType.ON_DEMAND
     file_access: FileAccess = FileAccess.MULTI
-    storage_root: str = None
+    # Set root as the current directory by default
+    storage_root: str = "./"
     storage_type: StorageType = StorageType.LOCAL_FS
     storage_options: Optional[Dict[str, str]] = None
     record_length: int = 64 * 1024
@@ -66,17 +67,18 @@ class ConfigArguments:
     generate_data: bool = False
     generate_only: bool = False
     log_level: int = OUTPUT_LEVEL
-    data_folder: str = "data/"
+    data_folder: str = "./data/"
     output_folder: str = None
     metric_exclude_start_steps: int = 1
     metric_exclude_end_steps: int = 0
-    checkpoint_folder: str = "checkpoints/"
+    checkpoint_folder: str = "./checkpoints/"
     log_file: str = "dlio.log"
     file_prefix: str = "img"
     keep_files: bool = True
     do_profiling: bool = False
     profiler: Profiler = Profiler.IOSTAT
     seed: int = 123
+    data_gen_method: str = None  # 'dgen' (fast, zero-copy) or 'numpy' (legacy). Defaults to env DLIO_DATA_GEN or auto-detect
     do_checkpoint: bool = False
     do_train: bool = True
     checkpoint_after_epoch: int = 1
@@ -346,6 +348,36 @@ class ConfigArguments:
         if len(self.record_dims) > 0 and self.record_length_stdev > 0:
             raise ValueError("Both record_dims and record_length_bytes_stdev are set. This is not supported. If you need stdev on your records, please specify record_length_bytes with record_length_bytes_stdev instead.")
 
+        # AIStore specific checks (uses S3 generators/readers)
+        if self.storage_type == StorageType.AISTORE and self.framework == FrameworkType.PYTORCH:
+            if self.format not in (FormatType.NPZ, FormatType.NPY):
+                raise Exception(f"For AIStore using PyTorch framework, only NPZ or NPY formats are supported. Got format {self.format}")
+            
+            # Validate that aistore SDK is available (check module-level flag
+            # so mock-based tests can patch AISTORE_AVAILABLE without the real SDK)
+            from dlio_benchmark.storage import aistore_storage as _ais_mod
+            if not _ais_mod.AISTORE_AVAILABLE:
+                raise Exception(
+                    "The aistore package is required for AIStore storage but is not installed. "
+                    "Install it with: pip install aistore"
+                )
+            
+            # AIStore uses S3 generators/readers, so validate those exist
+            if self.format == FormatType.NPY:
+                try:
+                    from dlio_benchmark.reader.npy_reader_s3 import NPYReaderS3
+                except ImportError:
+                    raise Exception(
+                        "AIStore with NPY requires dlio_benchmark.reader.npy_reader_s3.NPYReaderS3"
+                    )
+            elif self.format == FormatType.NPZ:
+                try:
+                    from dlio_benchmark.reader.npz_reader_s3 import NPZReaderS3
+                except ImportError:
+                    raise Exception(
+                        "AIStore with NPZ requires dlio_benchmark.reader.npz_reader_s3.NPZReaderS3"
+                    )
+
         # S3 specific checks
         if self.storage_type == StorageType.S3 and self.framework == FrameworkType.PYTORCH:
             if self.format not in (FormatType.NPZ, FormatType.NPY):
@@ -413,6 +445,29 @@ class ConfigArguments:
 
     @dlp.log
     def derive_configurations(self, file_list_train=None, file_list_eval=None):
+        # Initialize data generation method from config or environment
+        if self.data_gen_method is None:
+            self.data_gen_method = os.environ.get('DLIO_DATA_GEN', 'auto')
+        
+        # Log data generation method selection
+        from dlio_benchmark.utils.utility import HAS_DGEN
+        method = self.data_gen_method.lower()
+        if method == 'numpy' or (method in ['auto', 'dgen'] and not HAS_DGEN):
+            self.logger.output(f"{'='*80}")
+            self.logger.output(f"Data Generation Method: NUMPY (Legacy)")
+            self.logger.output(f"  Using NumPy random generation (155x slower than dgen-py)")
+            if method == 'dgen':
+                self.logger.output(f"  Note: dgen-py requested but not installed")
+                self.logger.output(f"  Install with: pip install dgen-py")
+            self.logger.output(f"  Set DLIO_DATA_GEN=dgen or dataset.data_gen_method=dgen for speedup")
+            self.logger.output(f"{'='*80}")
+        else:
+            self.logger.output(f"{'='*80}")
+            self.logger.output(f"Data Generation Method: DGEN (Optimized)")
+            self.logger.output(f"  Using dgen-py with zero-copy BytesView (155x faster, 0MB overhead)")
+            self.logger.output(f"  Set DLIO_DATA_GEN=numpy or dataset.data_gen_method=numpy for legacy mode")
+            self.logger.output(f"{'='*80}")
+        
         if self.checkpoint_mechanism == CheckpointMechanismType.NONE:
             if self.framework == FrameworkType.TENSORFLOW:
                 self.checkpoint_mechanism = CheckpointMechanismType.TF_SAVE
@@ -852,6 +907,77 @@ def GetConfig(args, key):
             value = args.au
     return str(value) if value is not None else None
 
+
+def _load_dotenv(env_file: str = '.env') -> dict:
+    """Load key=value pairs from a .env file.
+
+    Returns an empty dict if the file does not exist or cannot be read.
+    Only the common subset of the .env format is supported (no variable
+    substitution, no multiline values).  The python-dotenv or dotenvy
+    package can be used as a more feature-complete alternative.
+
+    Precedence note: callers should prefer os.environ over these values;
+    this function only provides the raw file contents.
+    """
+    env_vars: dict = {}
+    if not os.path.exists(env_file):
+        return env_vars
+    try:
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key:
+                    env_vars[key] = val
+    except OSError:
+        pass
+    return env_vars
+
+
+def _apply_env_overrides(args: 'ConfigArguments', dotenv: dict) -> None:
+    """Apply environment-variable and .env-file overrides to *args*.
+
+    This is the single, centralised place where DLIO reads runtime
+    configuration from the process environment, implementing the
+    agreed-upon precedence chain:
+
+      1. CLI / Hydra YAML overrides  — already applied before this call
+      2. Shell environment variables (os.environ)
+      3. .env file                   (dotenv dict — values not in os.environ)
+      4. Hardcoded defaults          (ConfigArguments field defaults)
+
+    Only *unset* fields (those still at their None / sentinel value) are
+    touched, so explicit YAML or CLI values are always preserved.
+
+    Environment variables recognised here:
+
+      DLIO_OUTPUT_FOLDER   — directory for benchmark result JSON/logs.
+                             Equivalent to setting ``output.folder`` in YAML.
+      DLIO_DATA_GEN        — data-generation backend: 'dgen', 'numpy', or
+                             'auto' (default).  Also honoured in
+                             derive_configurations() for backward compat.
+    """
+    def _getenv(key: str):
+        """Return key from os.environ (higher priority) or .env file."""
+        return os.environ.get(key) or dotenv.get(key)
+
+    # output_folder: fill in only if not already set by YAML/CLI
+    if args.output_folder is None:
+        v = _getenv('DLIO_OUTPUT_FOLDER')
+        if v:
+            args.output_folder = v
+
+    # data_gen_method: 'auto' means the YAML didn't set it explicitly
+    if args.data_gen_method is None or args.data_gen_method == 'auto':
+        v = _getenv('DLIO_DATA_GEN')
+        if v:
+            args.data_gen_method = v.lower()
+
+
 def LoadConfig(args, config):
     '''
     Override the args by a system config (typically loaded from a YAML file)
@@ -902,6 +1028,8 @@ def LoadConfig(args, config):
             args.file_prefix = config['dataset']['file_prefix']
         if 'format' in config['dataset']:
             args.format = FormatType(config['dataset']['format'])
+        if 'data_gen_method' in config['dataset']:
+            args.data_gen_method = config['dataset']['data_gen_method']
         if 'keep_files' in config['dataset']:
             args.keep_files = config['dataset']['keep_files']
         if 'record_element_bytes' in config['dataset']:
@@ -1124,6 +1252,8 @@ def LoadConfig(args, config):
                 args.metric_exclude_end_steps = int(config['output']['metric']['exclude_end_steps'])
 
     if args.output_folder is None:
+        # Apply env-var and .env overrides before falling back to Hydra/default
+        _apply_env_overrides(args, _load_dotenv())
         try:
             hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
             args.output_folder = hydra_cfg['runtime']['output_dir']

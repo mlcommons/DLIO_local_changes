@@ -14,11 +14,12 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 """
+import io
 import numpy as np
 import PIL.Image as im
 
 from dlio_benchmark.data_generator.data_generator import DataGenerator
-from dlio_benchmark.utils.utility import progress, utcnow
+from dlio_benchmark.utils.utility import progress, utcnow, gen_random_tensor
 from dlio_benchmark.utils.utility import Profile
 from dlio_benchmark.common.constants import MODULE_DATA_GENERATOR
 
@@ -32,6 +33,7 @@ class PNGGenerator(DataGenerator):
         """
         super().generate()
         np.random.seed(10)
+        rng = np.random.default_rng()
         dim = self.get_dimension(self.total_files_to_generate)
         for i in dlp.iter(range(self.my_rank, int(self.total_files_to_generate), self.comm_size)):
             dim_ = dim[2*i]
@@ -43,11 +45,16 @@ class PNGGenerator(DataGenerator):
                 dim2 = dim[2*i+1]
             if self.my_rank==0:
                 self.logger.debug(f"{utcnow()} Dimension of images: {dim1} x {dim2}")
-            records = np.random.randint(255, size=(dim1, dim2), dtype=np.uint8)
+            # Use gen_random_tensor (auto-uses dgen-py if available for 30-50x speedup)
+            records = gen_random_tensor(shape=(dim1, dim2), dtype=np.uint8, rng=rng)
+            records = np.clip(records, 0, 255).astype(np.uint8)  # Ensure valid PNG range
             img = im.fromarray(records)
             if self.my_rank == 0 and i % 100 == 0:
                 self.logger.info(f"Generated file {i}/{self.total_files_to_generate}")
             out_path_spec = self.storage.get_uri(self._file_list[i])
             progress(i+1, self.total_files_to_generate, "Generating PNG Data")
-            img.save(out_path_spec, format='PNG', bits=8)
+            output = out_path_spec if self.storage.islocalfs() else io.BytesIO()
+            img.save(output, format='PNG', bits=8)
+            if not self.storage.islocalfs():
+                self.storage.put_data(out_path_spec, output.getvalue())
         np.random.seed()

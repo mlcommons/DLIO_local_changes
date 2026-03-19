@@ -46,6 +46,11 @@ logging.basicConfig(
 from dlio_benchmark.main import DLIOBenchmark, set_dftracer_initialize, set_dftracer_finalize
 import glob
 
+# Output directory for test results — avoids landing in the repo root as 'output/'.
+# Set DLIO_TEST_OUTPUT_DIR env var to override (e.g. for parallel test runs).
+DLIO_TEST_OUTPUT_DIR = os.environ.get('DLIO_TEST_OUTPUT_DIR',
+                        os.environ.get('DLIO_OUTPUT_FOLDER', 'dlio_test_output'))
+
 def init():
     DLIOMPI.get_instance().initialize()
 
@@ -58,7 +63,7 @@ def clean(storage_root="./") -> None:
     if (comm.rank == 0):
         shutil.rmtree(os.path.join(storage_root, "checkpoints"), ignore_errors=True)
         shutil.rmtree(os.path.join(storage_root, "data/"), ignore_errors=True)
-        shutil.rmtree(os.path.join(storage_root, "output"), ignore_errors=True)
+        shutil.rmtree(os.path.join(storage_root, DLIO_TEST_OUTPUT_DIR), ignore_errors=True)
     comm.Barrier()
 
 
@@ -66,11 +71,15 @@ def run_benchmark(cfg, storage_root="./", verify=True):
 
     comm.Barrier()
     if (comm.rank == 0):
-        shutil.rmtree(os.path.join(storage_root, "output"), ignore_errors=True)
+        shutil.rmtree(os.path.join(storage_root, DLIO_TEST_OUTPUT_DIR), ignore_errors=True)
     comm.Barrier()
     t0 = time.time()
     ConfigArguments.reset()
-    benchmark = DLIOBenchmark(cfg['workload'])
+    # Use OmegaConf.to_container so that output.folder is explicitly named
+    # (DLIO_OUTPUT_FOLDER env var set by conftest.py also covers this path).
+    workload_dict = OmegaConf.to_container(cfg['workload'], resolve=True)
+    workload_dict.setdefault('output', {})['folder'] = DLIO_TEST_OUTPUT_DIR
+    benchmark = DLIOBenchmark(workload_dict)
     benchmark.initialize()
     benchmark.run()
     benchmark.finalize()

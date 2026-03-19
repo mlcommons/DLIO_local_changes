@@ -58,17 +58,7 @@ class StorageType(Enum):
     LOCAL_FS = 'local_fs'
     PARALLEL_FS = 'parallel_fs'
     S3 = 's3'
-
-    def __str__(self):
-        return self.value
-
-class StorageLibrary(Enum):
-    """
-    Different S3-compatible storage libraries
-    """
-    S3TORCHCONNECTOR = 's3torchconnector'  # Default from dpsi fork
-    S3DLIO = 's3dlio'                      # High-performance multi-protocol
-    MINIO = 'minio'                        # MinIO Python SDK
+    AISTORE = 'aistore'
 
     def __str__(self):
         return self.value
