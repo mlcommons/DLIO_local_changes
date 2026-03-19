@@ -18,7 +18,6 @@ from dlio_benchmark.storage.file_storage import FileStorage
 from dlio_benchmark.storage.s3_storage import S3Storage
 from dlio_benchmark.common.enumerations import StorageType
 from dlio_benchmark.common.error_code import ErrorCodes
-import os
 
 # Guarded import for AIStore native storage
 try:
@@ -46,19 +45,8 @@ class StorageFactory(object):
         elif storage_type == StorageType.S3:
             from dlio_benchmark.common.enumerations import FrameworkType
             if framework == FrameworkType.PYTORCH:
-                # Allow testing both implementations via environment variable
-                # DLIO_S3_IMPLEMENTATION=dpsi - use dpsi's architecture (bucket+key separation)
-                # DLIO_S3_IMPLEMENTATION=mlp (default) - use mlp-storage's multi-library architecture
-                impl = os.environ.get("DLIO_S3_IMPLEMENTATION", "mlp").lower()
-                
-                if impl == "dpsi":
-                    print(f"[StorageFactory] Using dpsi S3 implementation (bucket+key architecture)")
-                    from dlio_benchmark.storage.s3_torch_storage_dpsi import S3PyTorchConnectorStorage
-                    return S3PyTorchConnectorStorage(namespace, framework)
-                else:
-                    print(f"[StorageFactory] Using mlp-storage S3 implementation (multi-library, URI-based)")
-                    from dlio_benchmark.storage.s3_torch_storage import S3PyTorchConnectorStorage
-                    return S3PyTorchConnectorStorage(namespace, framework)
+                from dlio_benchmark.storage.obj_store_lib import ObjStoreLibStorage
+                return ObjStoreLibStorage(namespace, framework)
             return S3Storage(namespace, framework)
         else:
             raise Exception(str(ErrorCodes.EC1001))

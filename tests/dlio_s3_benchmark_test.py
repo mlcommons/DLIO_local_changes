@@ -59,6 +59,10 @@ logging.basicConfig(
 
 from dlio_benchmark.main import DLIOBenchmark, set_dftracer_initialize, set_dftracer_finalize
 
+# Output directory for test results — avoids 'output/' in the repo root.
+DLIO_TEST_OUTPUT_DIR = os.environ.get('DLIO_TEST_OUTPUT_DIR',
+                        os.environ.get('DLIO_OUTPUT_FOLDER', 'dlio_test_output'))
+
 def finalize():
     # DLIOMPI.get_instance().finalize()
     pass
@@ -81,7 +85,9 @@ def run_benchmark(cfg, verify=True):
     comm.Barrier()
     t0 = time.time()
     ConfigArguments.reset()
-    benchmark = DLIOBenchmark(cfg["workload"])
+    workload_dict = OmegaConf.to_container(cfg['workload'], resolve=True)
+    workload_dict.setdefault('output', {})['folder'] = DLIO_TEST_OUTPUT_DIR
+    benchmark = DLIOBenchmark(workload_dict)
     benchmark.initialize()
     benchmark.run()
     benchmark.finalize()
@@ -278,7 +284,7 @@ def patch_s3_checkpoint(setup_test_env):
 def test_s3_gen_data(setup_test_env, fmt, framework) -> None:
     storage_root, storage_type, mock_client, s3_overrides = setup_test_env
 
-    with patch("dlio_benchmark.storage.s3_torch_storage.S3Client", return_value=mock_client):
+    with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client):
         if (comm.rank == 0):
             logging.info("")
             logging.info("=" * 80)
@@ -311,7 +317,7 @@ def test_s3_gen_data(setup_test_env, fmt, framework) -> None:
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
 def test_s3_subset(setup_test_env) -> None:
     storage_root, storage_type, mock_client, s3_overrides = setup_test_env
-    with patch("dlio_benchmark.storage.s3_torch_storage.S3Client", return_value=mock_client):
+    with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client):
         if comm.rank == 0:
             logging.info("")
             logging.info("=" * 80)
@@ -342,7 +348,7 @@ def test_s3_subset(setup_test_env) -> None:
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
 def test_s3_eval(setup_test_env) -> None:
     storage_root, storage_type, mock_client, s3_overrides = setup_test_env
-    with patch("dlio_benchmark.storage.s3_torch_storage.S3Client", return_value=mock_client):
+    with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client):
         if (comm.rank == 0):
             logging.info("")
             logging.info("=" * 80)
@@ -366,7 +372,7 @@ def test_s3_eval(setup_test_env) -> None:
 @pytest.mark.parametrize("framework, nt", [("pytorch", 0), ("pytorch", 1), ("pytorch", 2)])
 def test_s3_multi_threads(setup_test_env, framework, nt) -> None:
     storage_root, storage_type, mock_client, s3_overrides = setup_test_env
-    with patch("dlio_benchmark.storage.s3_torch_storage.S3Client", return_value=mock_client):
+    with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client):
         if (comm.rank == 0):
             logging.info("")
             logging.info("=" * 80)
@@ -403,7 +409,7 @@ def test_s3_pytorch_multiprocessing_context(setup_test_env, nt, context, monkeyp
 
     # Patch globally using monkeypatch
     monkeypatch.setattr("s3torchconnector._s3client._s3client.S3Client", lambda *args, **kwargs: safe_mock_client)
-    monkeypatch.setattr("dlio_benchmark.storage.s3_torch_storage.S3Client", lambda *args, **kwargs: safe_mock_client)
+    monkeypatch.setattr("dlio_benchmark.storage.obj_store_lib.S3Client", lambda *args, **kwargs: safe_mock_client)
 
     if (comm.rank == 0):
         logging.info("")
@@ -441,7 +447,7 @@ def test_s3_train(setup_test_env, fmt, framework, dataloader, is_even) -> None:
         num_files = 16
     else:
         num_files = 17
-    with patch("dlio_benchmark.storage.s3_torch_storage.S3Client", return_value=mock_client):
+    with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client):
         if comm.rank == 0:
             logging.info("")
             logging.info("=" * 80)
@@ -479,7 +485,7 @@ def test_s3_checkpoint_epoch(patch_s3_checkpoint, framework, model_size, optimiz
         logging.info("=" * 80)
         logging.info(f" DLIO test for checkpointing at the end of epochs")
         logging.info("=" * 80)
-    with patch("dlio_benchmark.storage.s3_torch_storage.S3Client", return_value=mock_client):
+    with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client):
         with initialize_config_dir(version_base=None, config_dir=config_dir):
             epochs = 8
             epoch_per_ckp = 2
@@ -528,7 +534,7 @@ def test_s3_checkpoint_step(patch_s3_checkpoint) -> None:
         logging.info("=" * 80)
         logging.info(f" DLIO test for checkpointing at the end of steps")
         logging.info("=" * 80)
-    with patch("dlio_benchmark.storage.s3_torch_storage.S3Client", return_value=mock_client):
+    with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client):
         with initialize_config_dir(version_base=None, config_dir=config_dir):
             cfg = compose(config_name='config',
                           overrides=s3_overrides + ['++workload.workflow.train=True', \
@@ -564,7 +570,7 @@ def test_s3_checkpoint_ksm_config(patch_s3_checkpoint) -> None:
     # --- Test Case 1: KSM enabled with defaults ---
     # KSM is enabled just by adding the 'ksm: {}' section in overrides
     logging.info("Testing KSM enabled with defaults...")
-    with patch("dlio_benchmark.storage.s3_torch_storage.S3Client", return_value=mock_client):
+    with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client):
         with initialize_config_dir(version_base=None, config_dir=config_dir):
             cfg = compose(config_name='config',
                           overrides=s3_overrides + [
@@ -598,7 +604,7 @@ def test_s3_checkpoint_ksm_config(patch_s3_checkpoint) -> None:
 
     # --- Test Case 2: KSM enabled with overrides ---
     logging.info("Testing KSM enabled with overrides...")
-    with patch("dlio_benchmark.storage.s3_torch_storage.S3Client", return_value=mock_client):
+    with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client):
         with initialize_config_dir(version_base=None, config_dir=config_dir):
             cfg = compose(config_name='config',
                           overrides=s3_overrides + [
@@ -630,7 +636,7 @@ def test_s3_checkpoint_ksm_config(patch_s3_checkpoint) -> None:
 
     # --- Test Case 3: KSM disabled (section omitted) ---
     logging.info("Testing KSM disabled (section omitted)...")
-    with patch("dlio_benchmark.storage.s3_torch_storage.S3Client", return_value=mock_client):
+    with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client):
         with initialize_config_dir(version_base=None, config_dir=config_dir):
             cfg = compose(config_name='config',
                           overrides=s3_overrides + [

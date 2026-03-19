@@ -907,6 +907,77 @@ def GetConfig(args, key):
             value = args.au
     return str(value) if value is not None else None
 
+
+def _load_dotenv(env_file: str = '.env') -> dict:
+    """Load key=value pairs from a .env file.
+
+    Returns an empty dict if the file does not exist or cannot be read.
+    Only the common subset of the .env format is supported (no variable
+    substitution, no multiline values).  The python-dotenv or dotenvy
+    package can be used as a more feature-complete alternative.
+
+    Precedence note: callers should prefer os.environ over these values;
+    this function only provides the raw file contents.
+    """
+    env_vars: dict = {}
+    if not os.path.exists(env_file):
+        return env_vars
+    try:
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key:
+                    env_vars[key] = val
+    except OSError:
+        pass
+    return env_vars
+
+
+def _apply_env_overrides(args: 'ConfigArguments', dotenv: dict) -> None:
+    """Apply environment-variable and .env-file overrides to *args*.
+
+    This is the single, centralised place where DLIO reads runtime
+    configuration from the process environment, implementing the
+    agreed-upon precedence chain:
+
+      1. CLI / Hydra YAML overrides  — already applied before this call
+      2. Shell environment variables (os.environ)
+      3. .env file                   (dotenv dict — values not in os.environ)
+      4. Hardcoded defaults          (ConfigArguments field defaults)
+
+    Only *unset* fields (those still at their None / sentinel value) are
+    touched, so explicit YAML or CLI values are always preserved.
+
+    Environment variables recognised here:
+
+      DLIO_OUTPUT_FOLDER   — directory for benchmark result JSON/logs.
+                             Equivalent to setting ``output.folder`` in YAML.
+      DLIO_DATA_GEN        — data-generation backend: 'dgen', 'numpy', or
+                             'auto' (default).  Also honoured in
+                             derive_configurations() for backward compat.
+    """
+    def _getenv(key: str):
+        """Return key from os.environ (higher priority) or .env file."""
+        return os.environ.get(key) or dotenv.get(key)
+
+    # output_folder: fill in only if not already set by YAML/CLI
+    if args.output_folder is None:
+        v = _getenv('DLIO_OUTPUT_FOLDER')
+        if v:
+            args.output_folder = v
+
+    # data_gen_method: 'auto' means the YAML didn't set it explicitly
+    if args.data_gen_method is None or args.data_gen_method == 'auto':
+        v = _getenv('DLIO_DATA_GEN')
+        if v:
+            args.data_gen_method = v.lower()
+
+
 def LoadConfig(args, config):
     '''
     Override the args by a system config (typically loaded from a YAML file)
@@ -1181,6 +1252,8 @@ def LoadConfig(args, config):
                 args.metric_exclude_end_steps = int(config['output']['metric']['exclude_end_steps'])
 
     if args.output_folder is None:
+        # Apply env-var and .env overrides before falling back to Hydra/default
+        _apply_env_overrides(args, _load_dotenv())
         try:
             hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
             args.output_folder = hydra_cfg['runtime']['output_dir']

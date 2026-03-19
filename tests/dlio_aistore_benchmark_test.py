@@ -17,6 +17,7 @@
 
 #!/usr/bin/env python
 from hydra import initialize_config_dir, compose
+from omegaconf import OmegaConf
 import unittest
 from datetime import datetime
 import uuid
@@ -48,6 +49,10 @@ logging.basicConfig(
 )
 
 from dlio_benchmark.main import DLIOBenchmark
+
+# Output directory for test results — avoids 'output/' in the repo root.
+DLIO_TEST_OUTPUT_DIR = os.environ.get('DLIO_TEST_OUTPUT_DIR',
+                        os.environ.get('DLIO_OUTPUT_FOLDER', 'dlio_test_output'))
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +188,9 @@ def run_benchmark(cfg, verify=True):
     comm.Barrier()
     t0 = time.time()
     ConfigArguments.reset()
-    benchmark = DLIOBenchmark(cfg["workload"])
+    workload_dict = OmegaConf.to_container(cfg['workload'], resolve=True)
+    workload_dict.setdefault('output', {})['folder'] = DLIO_TEST_OUTPUT_DIR
+    benchmark = DLIOBenchmark(workload_dict)
     benchmark.initialize()
     benchmark.run()
     benchmark.finalize()

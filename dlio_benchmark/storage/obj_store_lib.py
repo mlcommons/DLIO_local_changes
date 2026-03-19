@@ -26,6 +26,14 @@ import os
 
 from dlio_benchmark.utils.utility import Profile
 
+# Module-level import so unittest.mock.patch can intercept S3Client in tests.
+# s3torchconnector may not be installed — None is the safe sentinel.
+try:
+    from s3torchconnector._s3client import S3Client, S3ClientConfig
+except ImportError:
+    S3Client = None       # type: ignore[assignment,misc]
+    S3ClientConfig = None  # type: ignore[assignment,misc]
+
 dlp = Profile(MODULE_STORAGE)
 
 
@@ -114,13 +122,17 @@ class MinIOAdapter:
         return [MinioListResult(obj_list, prefix)]
 
 
-class S3PyTorchConnectorStorage(S3Storage):
+class ObjStoreLibStorage(S3Storage):
     """
-    Storage APIs for S3-compatible object storage with multi-library support.
-    
+    Storage backend for object storage with multi-library support.
+
+    Decoupled from any specific URI scheme: the uri_scheme is read from
+    storage_options (defaulting to "s3") and applied to all URI construction
+    so the same code works with s3://, az://, gs://, file://, etc.
+
     Supports 3 storage libraries via YAML config:
-      storage_library: s3dlio           # s3dlio (zero-copy, multi-protocol)  
-      storage_library: s3torchconnector # AWS s3torchconnector (default)
+      storage_library: s3dlio           # zero-copy multi-protocol (s3/az/gs/file)
+      storage_library: s3torchconnector # AWS official S3 connector
       storage_library: minio            # MinIO native SDK
     """
 
@@ -142,7 +154,7 @@ class S3PyTorchConnectorStorage(S3Storage):
             storage_library = "s3torchconnector"  # default
         self.storage_library = storage_library
         
-        print(f"[S3PyTorchConnectorStorage] Using storage library: {storage_library}")
+        print(f"[ObjStoreLibStorage] Using storage library: {storage_library}")
         
         # Get credentials and endpoint config
         self.access_key_id = storage_options.get("access_key_id")
@@ -150,16 +162,25 @@ class S3PyTorchConnectorStorage(S3Storage):
         self.endpoint = storage_options.get("endpoint_url")
         self.region = storage_options.get("region", self._args.s3_region)
         
+        # URI scheme for object storage addressing.
+        # s3dlio supports multiple schemes: "s3", "az", "gs", "file", etc.
+        # minio and s3torchconnector are S3-only so they always use "s3".
+        # Override via storage_options.uri_scheme or the URI_SCHEME env var.
+        self.uri_scheme = storage_options.get(
+            "uri_scheme",
+            os.environ.get("DLIO_URI_SCHEME", "s3")
+        ).rstrip(":/")  # normalise: "s3://" → "s3"
+
         # Object key format configuration:
-        # - False/"path": Pass path-only keys (e.g., "path/to/object") - default, works with most APIs
-        # - True/"uri": Pass full URIs (e.g., "s3://bucket/path/to/object")
-        # Configurable via DLIO_OBJECT_KEY_USE_FULL_URI env var or storage_options
-        use_full_uri_str = os.environ.get("DLIO_OBJECT_KEY_USE_FULL_URI", 
+        # - False/"path": Pass path-only keys (e.g., "path/to/object") — default
+        # - True/"uri":   Pass full URIs (e.g., "s3://bucket/path/to/object")
+        # Configurable via DLIO_OBJECT_KEY_USE_FULL_URI env var or storage_options.
+        use_full_uri_str = os.environ.get("DLIO_OBJECT_KEY_USE_FULL_URI",
                                           storage_options.get("use_full_object_uri", "false"))
         self.use_full_object_uri = use_full_uri_str.lower() in ("true", "1", "yes")
-        
+
         if self.use_full_object_uri:
-            print(f"  → Object key format: Full URI (s3://bucket/path/object)")
+            print(f"  → Object key format: Full URI ({self.uri_scheme}://container/path/object)")
         else:
             print(f"  → Object key format: Path-only (path/object)")
 
@@ -187,36 +208,33 @@ class S3PyTorchConnectorStorage(S3Storage):
                 
         elif storage_library == "s3torchconnector":
             print(f"  → s3torchconnector: AWS official S3 connector (5-10 GB/s)")
-            try:
-                from s3torchconnector._s3client import S3Client, S3ClientConfig
-                
-                force_path_style_opt = self._args.s3_force_path_style
-                if "s3_force_path_style" in storage_options:
-                    force_path_style_opt = storage_options["s3_force_path_style"].strip().lower() == "true"
-                    
-                max_attempts_opt = self._args.s3_max_attempts
-                if "s3_max_attempts" in storage_options:
-                    try:
-                        max_attempts_opt = int(storage_options["s3_max_attempts"])
-                    except (TypeError, ValueError):
-                        max_attempts_opt = self._args.s3_max_attempts
-                        
-                s3_client_config = S3ClientConfig(
-                    force_path_style=force_path_style_opt,
-                    max_attempts=max_attempts_opt,
-                )
-                
-                self.s3_client = S3Client(
-                    region=self.region,
-                    endpoint=self.endpoint,
-                    s3client_config=s3_client_config,
-                )
-            except ImportError as e:
+            if S3Client is None:
                 raise ImportError(
-                    f"s3torchconnector is not installed. "
-                    f"Install with: pip install s3torchconnector\nError: {e}"
+                    "s3torchconnector is not installed. "
+                    "Install with: pip install s3torchconnector"
                 )
+            force_path_style_opt = self._args.s3_force_path_style
+            if "s3_force_path_style" in storage_options:
+                force_path_style_opt = storage_options["s3_force_path_style"].strip().lower() == "true"
                 
+            max_attempts_opt = self._args.s3_max_attempts
+            if "s3_max_attempts" in storage_options:
+                try:
+                    max_attempts_opt = int(storage_options["s3_max_attempts"])
+                except (TypeError, ValueError):
+                    max_attempts_opt = self._args.s3_max_attempts
+                    
+            s3_client_config = S3ClientConfig(
+                force_path_style=force_path_style_opt,
+                max_attempts=max_attempts_opt,
+            )
+            
+            self.s3_client = S3Client(
+                region=self.region,
+                endpoint=self.endpoint,
+                s3client_config=s3_client_config,
+            )
+            
         elif storage_library == "minio":
             print(f"  → minio: MinIO native SDK (10-15 GB/s)")
             try:
@@ -242,37 +260,37 @@ class S3PyTorchConnectorStorage(S3Storage):
     @dlp.log
     def get_uri(self, id):
         """
-        Construct full S3 URI from bucket (namespace) + object key (id).
-        MLP uses URI-based architecture: namespace is bucket, id is object key.
-        Returns: s3://bucket/path/to/object
+        Construct a full object URI from the configured namespace + object key.
+        Uses self.uri_scheme so the output is scheme-agnostic:
+          s3://container/path/to/object   (uri_scheme="s3")
+          az://container/path/to/object   (uri_scheme="az")
+          gs://container/path/to/object   (uri_scheme="gs")
+          file:///data/path/to/object     (uri_scheme="file")
         """
-        # Handle both absolute paths (s3://...) and relative paths
-        if id.startswith('s3://'):
-            return id  # Already a full URI
-        return f"s3://{self.namespace.name}/{id.lstrip('/')}"
+        # Already a full URI — return as-is regardless of scheme.
+        if '://' in str(id):
+            return id
+        return f"{self.uri_scheme}://{self.namespace.name}/{id.lstrip('/')}"
     
     def _normalize_object_key(self, uri):
         """
-        Convert s3:// URI to appropriate format for underlying storage library.
-        Returns: (bucket_name, object_key)
-        
-        If use_full_object_uri=True: object_key is full URI (s3://bucket/path/object)
-        If use_full_object_uri=False: object_key is path-only (path/object)
+        Decompose an object URI into (container, object_key) for the underlying
+        storage library.  Accepts any configured uri_scheme.
+
+        Returns: (container_name, object_key)
+          If use_full_object_uri=True:  object_key is the full URI as-is
+          If use_full_object_uri=False: object_key is the path portion only
         """
         parsed = urlparse(uri)
-        if parsed.scheme != 's3':
-            raise ValueError(f"Unsupported URI scheme: {parsed.scheme}")
-        
-        bucket_name = parsed.netloc
-        
-        if self.use_full_object_uri:
-            # Return full URI as object key
-            object_key = uri
-        else:
-            # Return path-only as object key (strip s3://bucket/ prefix)
-            object_key = parsed.path.lstrip('/')
-        
-        return bucket_name, object_key
+        if parsed.scheme != self.uri_scheme:
+            raise ValueError(
+                f"URI scheme '{parsed.scheme}' does not match configured "
+                f"uri_scheme '{self.uri_scheme}' (uri={uri})"
+            )
+
+        container_name = parsed.netloc
+        object_key = uri if self.use_full_object_uri else parsed.path.lstrip('/')
+        return container_name, object_key
 
     @dlp.log
     def create_namespace(self, exist_ok=False):
@@ -292,27 +310,28 @@ class S3PyTorchConnectorStorage(S3Storage):
 
     @dlp.log
     def walk_node(self, id, use_pattern=False):
-        # Parse s3://bucket/prefix path
         parsed = urlparse(id)
-        if parsed.scheme != 's3':
-            raise ValueError(f"Unsupported URI scheme: {parsed.scheme}")
-    
-        bucket = parsed.netloc
-        prefix = parsed.path.lstrip('/')
+        if parsed.scheme != self.uri_scheme:
+            raise ValueError(
+                f"URI scheme '{parsed.scheme}' does not match configured "
+                f"uri_scheme '{self.uri_scheme}'"
+            )
+
+        container = parsed.netloc
+        prefix    = parsed.path.lstrip('/')
 
         if not use_pattern:
-            return self.list_objects(bucket, prefix)
-        else:
-            ext = prefix.split('.')[-1]
-            if ext != ext.lower():
-                raise Exception(f"Unknown file format {ext}")
+            return self.list_objects(container, prefix)
 
-            # Pattern matching: check both lowercase and uppercase extensions
-            lower_results = self.list_objects(bucket, prefix)
-            upper_prefix = prefix.replace(ext, ext.upper())
-            upper_results = self.list_objects(bucket, upper_prefix)
+        ext = prefix.split('.')[-1]
+        if ext != ext.lower():
+            raise Exception(f"Unknown file format {ext}")
 
-            return lower_results + upper_results
+        # Pattern matching: check both lowercase and uppercase extensions.
+        lower_results = self.list_objects(container, prefix)
+        upper_prefix  = prefix.replace(ext, ext.upper())
+        upper_results = self.list_objects(container, upper_prefix)
+        return lower_results + upper_results
 
     @dlp.log
     def delete_node(self, id):
@@ -321,15 +340,14 @@ class S3PyTorchConnectorStorage(S3Storage):
     @dlp.log
     def put_data(self, id, data, offset=None, length=None):
         if self.storage_library == "s3dlio":
-            # Use s3dlio native API - simple put_bytes call
-            # id is already full s3:// URI from get_uri()
+            # s3dlio takes a full URI — id is already built by get_uri().
             payload = data.getvalue() if hasattr(data, 'getvalue') else data
             self._s3dlio.put_bytes(id, payload)
         else:
             # s3torchconnector or minio - use S3Client API
             bucket_name, object_key = self._normalize_object_key(id)
             writer = self.s3_client.put_object(bucket_name, object_key)
-            writer.write(data.getvalue())
+            writer.write(data.getvalue() if hasattr(data, 'getvalue') else data)
             writer.close()
         return None
 
@@ -353,45 +371,48 @@ class S3PyTorchConnectorStorage(S3Storage):
             return reader.read()
 
     @dlp.log
-    def list_objects(self, bucket_name, prefix=None):
+    def list_objects(self, container_name, prefix=None):
         paths = []
         try:
             if self.storage_library == "s3dlio":
-                # Use s3dlio native list API - takes full URI
-                uri = f"s3://{bucket_name}/{prefix.lstrip('/')}" if prefix else f"s3://{bucket_name}/"
+                # s3dlio takes a full URI — build one using the configured scheme.
+                base = f"{self.uri_scheme}://{container_name}/"
+                uri  = base + prefix.lstrip('/') if prefix else base
                 full_uris = self._s3dlio.list(uri)
-                # Return relative paths (strip bucket prefix)
+                # Return only the relative key portion (strips scheme+container prefix).
+                strip_len = len(base)
                 for full_uri in full_uris:
-                    if full_uri.startswith(f"s3://{bucket_name}/"):
-                        key = full_uri[len(f"s3://{bucket_name}/"):]
-                        paths.append(key)
+                    if full_uri.startswith(base):
+                        paths.append(full_uri[strip_len:])
             else:
-                # s3torchconnector or minio - use S3Client API
-                # Normalize prefix based on use_full_object_uri setting
+                # s3torchconnector / minio: use the S3Client-compatible API.
                 if self.use_full_object_uri:
-                    # Pass prefix as-is or reconstruct full URI format
-                    list_prefix = f"s3://{bucket_name}/{prefix.lstrip('/')}" if prefix else f"s3://{bucket_name}/"
+                    p = prefix.lstrip('/') if prefix else ""
+                    list_prefix = f"{self.uri_scheme}://{container_name}/{p}"
                 else:
-                    # Pass path-only prefix (default - works with most APIs)
                     list_prefix = prefix.lstrip('/') if prefix else ""
-                
+
                 if list_prefix and not list_prefix.endswith('/'):
                     list_prefix += '/'
-                
-                # Pass normalized prefix to underlying storage library
-                obj_stream = self.s3_client.list_objects(bucket_name, list_prefix)
+
+                obj_stream = self.s3_client.list_objects(container_name, list_prefix)
 
                 for list_obj_result in obj_stream:
-                    for obj_info in list_obj_result.object_info:
-                        key = obj_info.key
-                        # Strip the prefix from returned keys to get relative paths
+                    # Handle both structured results (real libs + MinIOAdapter)
+                    # and flat string results (some mocks / alternate implementations).
+                    if hasattr(list_obj_result, 'object_info'):
+                        items = [obj_info.key for obj_info in list_obj_result.object_info]
+                    else:
+                        # Flat string — wrap so the loop below is uniform.
+                        items = [list_obj_result]
+
+                    for key in items:
                         if list_prefix and key.startswith(list_prefix):
-                            stripped_key = key[len(list_prefix):]
-                            paths.append(stripped_key)
+                            paths.append(key[len(list_prefix):])
                         else:
                             paths.append(key)
         except Exception as e:
-            print(f"Error listing objects in bucket '{bucket_name}': {e}")
+            print(f"Error listing objects in '{container_name}': {e}")
 
         return paths
 
