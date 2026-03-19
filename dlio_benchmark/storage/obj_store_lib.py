@@ -144,14 +144,14 @@ class ObjStoreLibStorage(S3Storage):
         # Access config values from self._args (inherited from DataStorage)
         storage_options = getattr(self._args, "storage_options", {}) or {}
         
-        # Get storage library selection (default to s3torchconnector for backward compatibility)
-        # Check multiple sources: storage_options dict, env var, or direct config attribute
+        # Get storage library selection (default to s3torchconnector for backward compatibility).
+        # This value must flow from config.py via storage_options — never read from
+        # raw environment variables so that config.py is the single source of truth.
         if "storage_library" in storage_options:
             storage_library = storage_options["storage_library"]
-        elif os.environ.get("STORAGE_LIBRARY"):
-            storage_library = os.environ.get("STORAGE_LIBRARY")
         else:
-            storage_library = "s3torchconnector"  # default
+            storage_library = "s3torchconnector"  # default (mlp-storage/dlio_benchmark/config.py
+            # must inject storage.storage_library into storage_options for non-default libs)
         self.storage_library = storage_library
         
         print(f"[ObjStoreLibStorage] Using storage library: {storage_library}")
@@ -165,18 +165,14 @@ class ObjStoreLibStorage(S3Storage):
         # URI scheme for object storage addressing.
         # s3dlio supports multiple schemes: "s3", "az", "gs", "file", etc.
         # minio and s3torchconnector are S3-only so they always use "s3".
-        # Override via storage_options.uri_scheme or the URI_SCHEME env var.
-        self.uri_scheme = storage_options.get(
-            "uri_scheme",
-            os.environ.get("DLIO_URI_SCHEME", "s3")
-        ).rstrip(":/")  # normalise: "s3://" → "s3"
+        # Set via storage_options.uri_scheme in YAML config — not via env var.
+        self.uri_scheme = storage_options.get("uri_scheme", "s3").rstrip(":/")
 
         # Object key format configuration:
         # - False/"path": Pass path-only keys (e.g., "path/to/object") — default
         # - True/"uri":   Pass full URIs (e.g., "s3://bucket/path/to/object")
-        # Configurable via DLIO_OBJECT_KEY_USE_FULL_URI env var or storage_options.
-        use_full_uri_str = os.environ.get("DLIO_OBJECT_KEY_USE_FULL_URI",
-                                          storage_options.get("use_full_object_uri", "false"))
+        # Set via storage_options.use_full_object_uri in YAML config — not via env var.
+        use_full_uri_str = storage_options.get("use_full_object_uri", "false")
         self.use_full_object_uri = use_full_uri_str.lower() in ("true", "1", "yes")
 
         if self.use_full_object_uri:
@@ -195,11 +191,13 @@ class ObjStoreLibStorage(S3Storage):
             print(f"  → s3dlio: Zero-copy multi-protocol (20-30 GB/s)")
             try:
                 import s3dlio
-                # s3dlio uses native API - no client wrapper needed
-                # Just store the module for put_bytes/get_bytes calls
+                # s3dlio reads AWS_ENDPOINT_URL_S3 for custom endpoints (e.g. MinIO, VAST).
+                # Must be set before any s3dlio call so all operations hit the right host.
+                if self.endpoint:
+                    os.environ["AWS_ENDPOINT_URL_S3"] = self.endpoint
                 self.s3_client = None  # Not used for s3dlio
                 self._s3dlio = s3dlio
-                
+
             except ImportError as e:
                 raise ImportError(
                     f"s3dlio is not installed. "
@@ -375,15 +373,19 @@ class ObjStoreLibStorage(S3Storage):
         paths = []
         try:
             if self.storage_library == "s3dlio":
-                # s3dlio takes a full URI — build one using the configured scheme.
-                base = f"{self.uri_scheme}://{container_name}/"
-                uri  = base + prefix.lstrip('/') if prefix else base
-                full_uris = self._s3dlio.list(uri)
-                # Return only the relative key portion (strips scheme+container prefix).
-                strip_len = len(base)
+                # Build listing URI with trailing slash so the listing is prefix-scoped.
+                key_prefix = prefix.lstrip('/') if prefix else ''
+                list_uri = f"{self.uri_scheme}://{container_name}/{key_prefix}".rstrip('/') + '/'
+                # recursive=True so nested objects (e.g. train/file.npz) are included.
+                full_uris = self._s3dlio.list(list_uri, recursive=True)
+                # Strip the full listing URI so returned paths are RELATIVE to the
+                # listed prefix — callers expect bare filenames like "file.npz",
+                # not bucket-rooted paths like "dlio-train/train/file.npz".
                 for full_uri in full_uris:
-                    if full_uri.startswith(base):
-                        paths.append(full_uri[strip_len:])
+                    if full_uri.startswith(list_uri):
+                        relative = full_uri[len(list_uri):]
+                        if relative:
+                            paths.append(relative)
             else:
                 # s3torchconnector / minio: use the S3Client-compatible API.
                 if self.use_full_object_uri:
