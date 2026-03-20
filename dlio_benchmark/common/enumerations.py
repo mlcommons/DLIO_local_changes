@@ -26,7 +26,8 @@ class CheckpointMechanismType(Enum):
     CUSTOM = 'custom'
     TF_SAVE = 'tf_save'
     PT_SAVE = 'pt_save'
-    PT_S3_SAVE = 'pt_s3_save'
+    PT_S3_SAVE = 'pt_s3_save'   # s3torchconnector native S3Checkpoint API
+    PT_OBJ_SAVE = 'pt_obj_save' # Generic object-store (minio or s3dlio)
 
     def __str__(self):
         return self.value
@@ -56,6 +57,7 @@ class StorageType(Enum):
     Different types of underlying storage
     """
     LOCAL_FS = 'local_fs'
+    DIRECT_FS = 'direct_fs'
     PARALLEL_FS = 'parallel_fs'
     S3 = 's3'
     AISTORE = 'aistore'

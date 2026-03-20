@@ -32,7 +32,7 @@ class StorageFactory(object):
 
     @staticmethod
     def get_storage(storage_type, namespace, framework=None):
-        if storage_type == StorageType.LOCAL_FS:
+        if storage_type == StorageType.LOCAL_FS or storage_type == StorageType.DIRECT_FS:
             return FileStorage(namespace, framework)
         elif storage_type == StorageType.AISTORE:
             # Native AIStore storage using official Python SDK
