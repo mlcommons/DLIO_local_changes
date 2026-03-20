@@ -18,10 +18,36 @@ import os
 import torch
 import ctypes
 import numpy as np
-from dlio_benchmark.checkpointing.base_checkpointing import BaseCheckpointing
+from dlio_benchmark.checkpointing.base_checkpointing import BaseCheckpointing, get_datatype_size
 from dlio_benchmark.utils.utility import Profile, dft_ai, gen_random_tensor
 
 from dlio_benchmark.common.constants import MODULE_CHECKPOINT
+
+
+class _SizePlaceholder:
+    """Zero-allocation stand-in for a model tensor (file backend).
+
+    get_tensor_core() returns this instead of a real torch.Tensor so the
+    benchmark can represent 70B+ parameter models without materialising them
+    in RAM.  save_state() uses StreamingCheckpointing to write the matching
+    byte count via dgen-py; load_state() issues range-GETs of the same size.
+    """
+    __slots__ = ('size_bytes',)
+    def __init__(self, num_elements: int, datatype: str = 'int8'):
+        self.size_bytes = int(num_elements) * get_datatype_size(datatype)
+
+
+def _compute_state_bytes(state) -> int:
+    """Sum bytes of all _SizePlaceholder (or real tensor) leaves in *state*."""
+    if isinstance(state, _SizePlaceholder):
+        return state.size_bytes
+    if isinstance(state, dict):
+        return sum(_compute_state_bytes(v) for v in state.values())
+    if isinstance(state, (list, tuple)):
+        return sum(_compute_state_bytes(v) for v in state)
+    if hasattr(state, 'nbytes'):   # real torch / numpy tensor fallback
+        return state.nbytes
+    return 0
 
 def get_torch_datatype(datatype):
     if datatype == "fp32":
@@ -57,8 +83,57 @@ class PyTorchCheckpointing(BaseCheckpointing):
     def __init__(self):
         super().__init__("pt")
 
-    @dlp.log
     def get_tensor_core(self, length, datatype="int8", randomize=True):
+        """Return a _SizePlaceholder — no tensor memory allocated."""
+        return _SizePlaceholder(length, datatype)
+
+    def _get_streaming(self):
+        """Build (once per backend) a StreamingCheckpointing instance.
+
+        Backend selection is driven by ``storage.storage_type`` in the DLIO
+        config:
+
+        * ``local_fs``  — buffered POSIX I/O + fadvise(DONTNEED) so reads
+          always hit the storage device rather than the page cache.
+        * ``direct_fs`` — O_DIRECT via s3dlio's ``direct://`` URI ; the kernel
+          page cache is bypassed entirely, giving the cleanest possible
+          measurement of raw storage throughput.  Requires s3dlio >= 0.9.x.
+        """
+        from dlio_benchmark.common.enumerations import StorageType
+
+        try:
+            use_direct = (self.args.storage_type == StorageType.DIRECT_FS)
+        except AttributeError:
+            use_direct = False
+
+        cache_key = 'direct_fs' if use_direct else 'file'
+        if not hasattr(self, '_streaming_cache'):
+            self._streaming_cache = {}
+
+        if cache_key not in self._streaming_cache:
+            from mlpstorage.checkpointing import StreamingCheckpointing as _SC
+            if use_direct:
+                self._streaming_cache[cache_key] = _SC(
+                    chunk_size=32 * 1024 * 1024,
+                    num_buffers=4,
+                    use_dgen=True,
+                    backend='direct_fs',
+                    fadvise_mode='none',   # O_DIRECT: page cache never populated
+                    num_parallel_readers=4,
+                )
+            else:
+                self._streaming_cache[cache_key] = _SC(
+                    chunk_size=32 * 1024 * 1024,
+                    num_buffers=4,
+                    use_dgen=True,
+                    backend='file',
+                    fadvise_mode='dontneed',
+                    num_parallel_readers=4,
+                )
+        return self._streaming_cache[cache_key]
+
+    def _get_real_tensor_core(self, length, datatype="int8", randomize=True):
+        """Original torch-tensor implementation (kept for unit tests / non-checkpoint use)."""
         torch_dtype=get_torch_datatype(datatype)
         if randomize:
             # Use gen_random_tensor() to leverage dgen-py (155x faster than torch.rand)
@@ -98,8 +173,12 @@ class PyTorchCheckpointing(BaseCheckpointing):
         1. Validates madvise is initialized and the tensor has valid memory pointers
         2. Calculates page-aligned memory boundaries for the tensor
         3. Applies madvise(MADV_MERGEABLE) to the aligned region
+
+        Returns False immediately for _SizePlaceholder (no real memory to advise).
         """
         if not self.madvise_ready:
+            return False
+        if isinstance(tensor, _SizePlaceholder):
             return False
 
         try:
@@ -144,20 +223,29 @@ class PyTorchCheckpointing(BaseCheckpointing):
             return False
 
     @dft_ai.checkpoint.capture
-    def save_state(self, suffix, state, fsync = False):
-        name = self.get_name(suffix)
-        with open(name, "wb") as f:
-            torch.save(state, f)
-            if fsync: 
-                os.fsync(f.fileno())
+    def save_state(self, suffix, state, fsync=False):
+        """Stream synthetic data of the correct byte-count to the file backend.
+
+        fsync is honoured only when the underlying OS supports it — the
+        StreamingCheckpointing file writer respects it via O_DSYNC / fsync.
+        """
+        name        = self.get_name(suffix)
+        total_bytes = _compute_state_bytes(state)
+        if total_bytes <= 0:
+            self.logger.warning(f"save_state: 0 bytes for '{suffix}', skipping")
+            return
+        self._get_streaming().save(name, total_bytes)
 
     @dft_ai.checkpoint.restart
     def load_state(self, suffix, state):
-        name = self.get_name(suffix)
-        state = dict() # clear up
-        state = torch.load(name)
-        self.logger.debug(f"checkpoint state loaded: {state}")
-        assert(len(state.keys())>0)
+        """Stream-read the checkpoint file and discard data (throughput benchmark)."""
+        name        = self.get_name(suffix)
+        total_bytes = _compute_state_bytes(state)
+        if total_bytes <= 0:
+            self.logger.warning(f"load_state: 0 bytes for '{suffix}', skipping")
+            return
+        self._get_streaming().load(name, total_bytes)
+        assert len(state.keys()) > 0
 
     @dlp.log
     def save_checkpoint(self, epoch, step_number):

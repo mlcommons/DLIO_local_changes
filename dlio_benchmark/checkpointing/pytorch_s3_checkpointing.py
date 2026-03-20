@@ -18,7 +18,11 @@ import os
 import torch
 import ctypes
 from dlio_benchmark.checkpointing.base_checkpointing import BaseCheckpointing
-from dlio_benchmark.checkpointing.pytorch_checkpointing import PyTorchCheckpointing
+from dlio_benchmark.checkpointing.pytorch_checkpointing import (
+    PyTorchCheckpointing,
+    _SizePlaceholder,
+    _compute_state_bytes,
+)
 from dlio_benchmark.utils.utility import Profile, dft_ai
 
 from dlio_benchmark.common.constants import MODULE_CHECKPOINT
@@ -76,21 +80,40 @@ class PyTorchS3Checkpointing(PyTorchCheckpointing):
         )
 
     @dft_ai.checkpoint.capture
-    def save_state(self, suffix, state, fsync = False):
-        name = self.get_name(suffix)
-        # Save checkpoint to S3
-        with self.s3_checkpoint.writer(name) as writer:
-            torch.save(state, writer)
+    def save_state(self, suffix, state, fsync=False):
+        """Stream synthetic data of the correct byte-count via s3torchconnector."""
+        name        = self.get_name(suffix)
+        total_bytes = _compute_state_bytes(state)
+        if total_bytes <= 0:
+            return
+        self._get_streaming().save(name, total_bytes)
 
     @dft_ai.checkpoint.restart
     def load_state(self, suffix, state):
-        name = self.get_name(suffix)
-        state = dict() # clear up
-        # Load checkpoint from S3
-        with self.s3_checkpoint.reader(name) as reader:
-            state = torch.load(reader)
-        self.logger.debug(f"checkpoint state loaded: {state}")
-        assert(len(state.keys())>0)
+        """Stream-read checkpoint via s3torchconnector and discard data."""
+        name        = self.get_name(suffix)
+        total_bytes = _compute_state_bytes(state)
+        if total_bytes <= 0:
+            return
+        self._get_streaming().load(name, total_bytes)
+        assert len(state.keys()) > 0
+
+    def _get_streaming(self):
+        """Build (once) a StreamingCheckpointing for the s3torchconnector backend."""
+        if not hasattr(self, '_streaming'):
+            from mlpstorage.checkpointing import StreamingCheckpointing as _SC
+            self._streaming = _SC(
+                chunk_size=32 * 1024 * 1024,
+                num_buffers=4,
+                use_dgen=True,
+                backend='s3torchconnector',
+                num_parallel_readers=8,
+            )
+        return self._streaming
+
+    def get_tensor_core(self, length, datatype="int8", randomize=True):
+        """Return a _SizePlaceholder \u2014 no tensor memory allocated."""
+        return _SizePlaceholder(length, datatype)
 
     @dlp.log
     def save_checkpoint(self, epoch, step_number):

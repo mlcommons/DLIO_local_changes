@@ -378,30 +378,79 @@ class ConfigArguments:
                         "AIStore with NPZ requires dlio_benchmark.reader.npz_reader_s3.NPZReaderS3"
                     )
 
-        # S3 specific checks
+        # S3 specific checks — all branches are storage_library-aware.
+        # storage_type=s3 means "object storage"; storage_library selects which
+        # SDK to use (minio, s3dlio, or s3torchconnector).  Do NOT conflate them.
         if self.storage_type == StorageType.S3 and self.framework == FrameworkType.PYTORCH:
-            if self.format not in (FormatType.NPZ, FormatType.NPY):
-                raise Exception(f"For S3 using PyTorch framework, only NPZ or NPY formats are supported. Got format {self.format}")
+            # Determine which storage library is selected (default: s3torchconnector
+            # for backwards compatibility with existing configs that omit storage_library).
+            storage_library = (self.storage_options or {}).get("storage_library", "s3torchconnector")
 
-            # Also validate that s3torchconnector dependency is available
-            try:
-                from s3torchconnector._s3client import S3Client, S3ClientConfig
-            except ImportError:
-                raise Exception(
-                    "The s3torchconnector package is required for S3 with PyTorch but is not installed. "
-                    "Please install it before running the benchmark data generation or loading for S3."
-                )
-
-            if self.do_checkpoint == True:
+            if storage_library == "s3torchconnector":
+                # s3torchconnector only supports NPZ and NPY data formats for training.
+                # For checkpoint-only runs (train=False), data format doesn't apply.
+                if self.do_train and self.format not in (FormatType.NPZ, FormatType.NPY):
+                    raise Exception(f"For S3 using s3torchconnector, only NPZ or NPY formats are supported. Got format {self.format}")
+                # Validate that s3torchconnector is installed
                 try:
-                    from s3torchconnector import S3Checkpoint
+                    from s3torchconnector._s3client import S3Client, S3ClientConfig
                 except ImportError:
                     raise Exception(
-                        "The s3torchconnector package is required for S3 with PyTorch but is not installed. "
-                        "Please install it before running the benchmark checkpointing for S3."
+                        "storage_library=s3torchconnector is configured but the package is not installed. "
+                        "Install with: pip install s3torchconnector\n"
+                        "Or switch to: storage_library: minio  (or s3dlio)"
                     )
-                if self.checkpoint_mechanism != CheckpointMechanismType.PT_S3_SAVE:
-                    raise Exception(f"For S3 checkpointing using PyTorch framework, invalid mechanism type supported. Got mechanism type as {self.checkpoint_mechanism}")
+                if self.do_checkpoint:
+                    try:
+                        from s3torchconnector import S3Checkpoint
+                    except ImportError:
+                        raise Exception(
+                            "storage_library=s3torchconnector is configured but the package is not installed. "
+                            "Install with: pip install s3torchconnector"
+                        )
+                    if self.checkpoint_mechanism != CheckpointMechanismType.PT_S3_SAVE:
+                        raise Exception(
+                            f"For S3 checkpointing with s3torchconnector, checkpoint_mechanism must be "
+                            f"pt_s3_save. Got: {self.checkpoint_mechanism}"
+                        )
+
+            elif storage_library == "minio":
+                # Validate that minio SDK is installed
+                try:
+                    from minio import Minio  # noqa: F401
+                except ImportError:
+                    raise Exception(
+                        "storage_library=minio is configured but the minio package is not installed. "
+                        "Install with: pip install minio"
+                    )
+                if self.do_checkpoint:
+                    if self.checkpoint_mechanism != CheckpointMechanismType.PT_OBJ_SAVE:
+                        raise Exception(
+                            f"For S3 checkpointing with minio, checkpoint_mechanism must be "
+                            f"pt_obj_save. Got: {self.checkpoint_mechanism}"
+                        )
+
+            elif storage_library == "s3dlio":
+                # Validate that s3dlio is installed
+                try:
+                    import s3dlio  # noqa: F401
+                except ImportError:
+                    raise Exception(
+                        "storage_library=s3dlio is configured but the s3dlio package is not installed. "
+                        "Install with: pip install s3dlio"
+                    )
+                if self.do_checkpoint:
+                    if self.checkpoint_mechanism != CheckpointMechanismType.PT_OBJ_SAVE:
+                        raise Exception(
+                            f"For S3 checkpointing with s3dlio, checkpoint_mechanism must be "
+                            f"pt_obj_save. Got: {self.checkpoint_mechanism}"
+                        )
+
+            else:
+                raise Exception(
+                    f"Unknown storage_library: '{storage_library}'. "
+                    f"Supported values: s3torchconnector, minio, s3dlio"
+                )
 
             if self.format == FormatType.NPY:
                 # Ensure the NPY S3 reader is used with s3
@@ -422,20 +471,21 @@ class ConfigArguments:
                         "but it could not be imported. Ensure the module is available."
                     )
 
-            # Validate required credentials is set for s3 (from config)
+            # Validate required credentials are present in storage_options
             missing = []
-            access_key_id = self.storage_options.get("access_key_id")
+            access_key_id = (self.storage_options or {}).get("access_key_id")
             if not access_key_id:
                 missing.append("storage_options['access_key_id']")
-            secret_access_key = self.storage_options.get("secret_access_key")
+            secret_access_key = (self.storage_options or {}).get("secret_access_key")
             if not secret_access_key:
                 missing.append("storage_options['secret_access_key']")
-            endpoint = self.storage_options.get("endpoint_url")
+            endpoint = (self.storage_options or {}).get("endpoint_url")
             if not endpoint:
                 missing.append("storage_options['endpoint_url']")
             if missing:
                 raise Exception(
-                    "Missing required S3 credentials for s3torchconnector: " + ", ".join(missing)
+                    f"Missing required S3 credentials for storage_library={storage_library}: "
+                    + ", ".join(missing)
                 )
 
 
@@ -473,7 +523,14 @@ class ConfigArguments:
                 self.checkpoint_mechanism = CheckpointMechanismType.TF_SAVE
             elif self.framework == FrameworkType.PYTORCH:
                 if self.storage_type == StorageType.S3:
-                    self.checkpoint_mechanism = CheckpointMechanismType.PT_S3_SAVE
+                    # storage_type=s3 with PyTorch: choose mechanism based on storage_library.
+                    # s3torchconnector uses its native S3Checkpoint API (PT_S3_SAVE).
+                    # minio and s3dlio use the generic ObjStoreLib checkpoint (PT_OBJ_SAVE).
+                    storage_library = (self.storage_options or {}).get("storage_library", "s3torchconnector")
+                    if storage_library == "s3torchconnector":
+                        self.checkpoint_mechanism = CheckpointMechanismType.PT_S3_SAVE
+                    else:
+                        self.checkpoint_mechanism = CheckpointMechanismType.PT_OBJ_SAVE
                 else:
                     self.checkpoint_mechanism = CheckpointMechanismType.PT_SAVE
 
@@ -991,7 +1048,11 @@ def LoadConfig(args, config):
         if 'storage_root' in config['storage']:
             args.storage_root = config['storage']['storage_root']
         if 'storage_options' in config['storage']:
-            args.storage_options = config['storage']['storage_options']
+            # Convert OmegaConf DictConfig to a plain Python dict so that callers
+            # can freely add new keys (e.g. storage_library promotion below).
+            # OmegaConf structs are closed by default and reject unknown keys.
+            opts = config['storage']['storage_options']
+            args.storage_options = OmegaConf.to_container(opts, resolve=True, throw_on_missing=False) if isinstance(opts, DictConfig) else dict(opts)
         # storage.storage_library lives at the top-level of the storage section,
         # not nested inside storage_options.  Inject it into storage_options here
         # so that storage backends can find it via storage_options.get("storage_library")
