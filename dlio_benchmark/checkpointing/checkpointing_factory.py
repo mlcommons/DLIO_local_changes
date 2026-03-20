@@ -39,8 +39,11 @@ class CheckpointingFactory(object):
         elif checkpoint_mechanism_type == CheckpointMechanismType.PT_SAVE:
             from dlio_benchmark.checkpointing.pytorch_checkpointing import PyTorchCheckpointing
             return PyTorchCheckpointing.get_instance()
-        elif checkpoint_mechanism_type == CheckpointMechanismType.PT_S3_SAVE:
-            from dlio_benchmark.checkpointing.pytorch_s3_checkpointing import PyTorchS3Checkpointing
-            return PyTorchS3Checkpointing.get_instance()
+        elif checkpoint_mechanism_type in (
+            CheckpointMechanismType.PT_S3_SAVE,
+            CheckpointMechanismType.PT_OBJ_SAVE,
+        ):
+            from dlio_benchmark.checkpointing.pytorch_obj_store_checkpointing import PyTorchObjStoreCheckpointing
+            return PyTorchObjStoreCheckpointing.get_instance()
         else:
             raise Exception(str(ErrorCodes.EC1005))
