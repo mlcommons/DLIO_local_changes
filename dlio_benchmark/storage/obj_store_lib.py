@@ -14,6 +14,7 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 """
+import logging
 from time import time
 from io import BytesIO
 
@@ -143,7 +144,18 @@ class ObjStoreLibStorage(S3Storage):
 
         # Access config values from self._args (inherited from DataStorage)
         storage_options = getattr(self._args, "storage_options", {}) or {}
-        
+
+        logging.debug(f"ObjStoreLibStorage.__init__: namespace={namespace!r}")
+        logging.debug(f"  framework={framework!r}")
+        logging.debug(f"  storage_options={storage_options!r}")
+        logging.debug(f"  args.storage_type={getattr(self._args, 'storage_type', '<missing>')!r}")
+        logging.debug(f"  args.storage_root={getattr(self._args, 'storage_root', '<missing>')!r}")
+        logging.debug(f"  args.data_folder={getattr(self._args, 'data_folder', '<missing>')!r}")
+        logging.debug(f"  args.s3_region={getattr(self._args, 's3_region', '<missing>')!r}")
+        logging.debug(f"  env AWS_ENDPOINT_URL={os.environ.get('AWS_ENDPOINT_URL', '<not set>')!r}")
+        logging.debug(f"  env AWS_ENDPOINT_URL_S3={os.environ.get('AWS_ENDPOINT_URL_S3', '<not set>')!r}")
+        logging.debug(f"  env AWS_ACCESS_KEY_ID={'<set>' if os.environ.get('AWS_ACCESS_KEY_ID') else '<not set>'}")
+
         # Get storage library selection (default to s3torchconnector for backward compatibility).
         # This value must flow from config.py via storage_options — never read from
         # raw environment variables so that config.py is the single source of truth.
@@ -154,14 +166,29 @@ class ObjStoreLibStorage(S3Storage):
             # must inject storage.storage_library into storage_options for non-default libs)
         self.storage_library = storage_library
         
-        print(f"[ObjStoreLibStorage] Using storage library: {storage_library}")
+        logging.debug(f"ObjStoreLibStorage: using storage library: {storage_library}")
         
-        # Get credentials and endpoint config
-        self.access_key_id = storage_options.get("access_key_id")
-        self.secret_access_key = storage_options.get("secret_access_key")
-        self.endpoint = storage_options.get("endpoint_url")
-        self.region = storage_options.get("region", self._args.s3_region)
-        
+        # Get credentials and endpoint config.
+        # Credentials MUST NOT be hardcoded in YAML — they come from env vars
+        # (set via .env file before launching dlio_benchmark).  storage_options
+        # may only contain non-sensitive settings (endpoint_url, region, etc.).
+        # If the key IS present in storage_options it takes priority, which
+        # allows per-run overrides without touching the YAML on disk.
+        self.access_key_id = storage_options.get("access_key_id") or os.environ.get("AWS_ACCESS_KEY_ID")
+        self.secret_access_key = storage_options.get("secret_access_key") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+        self.endpoint = storage_options.get("endpoint_url") or os.environ.get("AWS_ENDPOINT_URL")
+        self.region = storage_options.get("region") or os.environ.get("AWS_REGION") or getattr(self._args, "s3_region", "us-east-1")
+
+        if logging.isEnabledFor(logging.DEBUG):
+            src_key = "storage_options" if storage_options.get("access_key_id") else "AWS_ACCESS_KEY_ID env"
+            src_sec = "storage_options" if storage_options.get("secret_access_key") else "AWS_SECRET_ACCESS_KEY env"
+            src_ep  = "storage_options" if storage_options.get("endpoint_url") else "AWS_ENDPOINT_URL env"
+            logging.debug("ObjStoreLibStorage: credentials/endpoint resolved (storage_options → env fallback):")
+            logging.debug(f"  access_key_id  = {'<set> [' + src_key + ']' if self.access_key_id else '<MISSING — set AWS_ACCESS_KEY_ID>'}")
+            logging.debug(f"  secret_key     = {'<set> [' + src_sec + ']' if self.secret_access_key else '<MISSING — set AWS_SECRET_ACCESS_KEY>'}")
+            logging.debug(f"  endpoint_url   = {self.endpoint!r}  [{src_ep}]")
+            logging.debug(f"  region         = {self.region!r}")
+
         # URI scheme for object storage addressing.
         # s3dlio supports multiple schemes: "s3", "az", "gs", "file", etc.
         # minio and s3torchconnector are S3-only so they always use "s3".
@@ -176,9 +203,9 @@ class ObjStoreLibStorage(S3Storage):
         self.use_full_object_uri = use_full_uri_str.lower() in ("true", "1", "yes")
 
         if self.use_full_object_uri:
-            print(f"  → Object key format: Full URI ({self.uri_scheme}://container/path/object)")
+            logging.debug(f"ObjStoreLibStorage: object key format: Full URI ({self.uri_scheme}://container/path/object)")
         else:
-            print(f"  → Object key format: Path-only (path/object)")
+            logging.debug("ObjStoreLibStorage: object key format: Path-only (path/object)")
 
         # Set environment variables for libraries that use them
         if self.access_key_id:
@@ -188,13 +215,14 @@ class ObjStoreLibStorage(S3Storage):
 
         # Dynamically import and initialize the appropriate library
         if storage_library == "s3dlio":
-            print(f"  → s3dlio: Zero-copy multi-protocol (20-30 GB/s)")
+            logging.debug("ObjStoreLibStorage: using s3dlio — zero-copy multi-protocol (20-30 GB/s)")
             try:
                 import s3dlio
-                # s3dlio reads AWS_ENDPOINT_URL_S3 for custom endpoints (e.g. MinIO, VAST).
-                # Must be set before any s3dlio call so all operations hit the right host.
+                # s3dlio reads AWS_ENDPOINT_URL for custom endpoints (MinIO, VAST, Ceph).
+                # AWS_ENDPOINT_URL_S3 is NOT used by s3dlio — must use AWS_ENDPOINT_URL.
                 if self.endpoint:
-                    os.environ["AWS_ENDPOINT_URL_S3"] = self.endpoint
+                    os.environ["AWS_ENDPOINT_URL"] = self.endpoint
+                    logging.debug(f"s3dlio: set AWS_ENDPOINT_URL={self.endpoint}")
                 self.s3_client = None  # Not used for s3dlio
                 self._s3dlio = s3dlio
 
@@ -205,7 +233,7 @@ class ObjStoreLibStorage(S3Storage):
                 )
                 
         elif storage_library == "s3torchconnector":
-            print(f"  → s3torchconnector: AWS official S3 connector (5-10 GB/s)")
+            logging.debug("ObjStoreLibStorage: using s3torchconnector — AWS official S3 connector (5-10 GB/s)")
             if S3Client is None:
                 raise ImportError(
                     "s3torchconnector is not installed. "
@@ -234,7 +262,7 @@ class ObjStoreLibStorage(S3Storage):
             )
             
         elif storage_library == "minio":
-            print(f"  → minio: MinIO native SDK (10-15 GB/s)")
+            logging.debug("ObjStoreLibStorage: using minio — MinIO native SDK (10-15 GB/s)")
             try:
                 secure = storage_options.get("secure", True)
                 self.s3_client = MinIOAdapter(
@@ -308,6 +336,7 @@ class ObjStoreLibStorage(S3Storage):
 
     @dlp.log
     def walk_node(self, id, use_pattern=False):
+        id = self.get_uri(id)  # normalize bare path → full URI (e.g. data/unet3d/train → s3://bucket/data/unet3d/train)
         parsed = urlparse(id)
         if parsed.scheme != self.uri_scheme:
             raise ValueError(
@@ -319,7 +348,8 @@ class ObjStoreLibStorage(S3Storage):
         prefix    = parsed.path.lstrip('/')
 
         if not use_pattern:
-            return self.list_objects(container, prefix)
+            results = self.list_objects(container, prefix)
+            return results
 
         ext = prefix.split('.')[-1]
         if ext != ext.lower():
@@ -335,12 +365,33 @@ class ObjStoreLibStorage(S3Storage):
     def delete_node(self, id):
         return super().delete_node(self.get_uri(id))
 
+    # Threshold above which s3dlio uses MultipartUploadWriter instead of put_bytes.
+    # minio-py uses 5 MB; 16 MB is a good balance for MinIO with large objects.
+    # Override via S3DLIO_MULTIPART_THRESHOLD_MB env var (set before import).
+    _MULTIPART_THRESHOLD = int(os.environ.get("S3DLIO_MULTIPART_THRESHOLD_MB", "16")) * 1024 * 1024
+
     @dlp.log
     def put_data(self, id, data, offset=None, length=None):
         if self.storage_library == "s3dlio":
             # s3dlio takes a full URI — id is already built by get_uri().
-            payload = data.getvalue() if hasattr(data, 'getvalue') else data
-            self._s3dlio.put_bytes(id, payload)
+            # Use getbuffer() when possible: it returns a zero-copy memoryview of
+            # the BytesIO internal buffer. getvalue() makes an extra full copy.
+            if hasattr(data, 'getbuffer'):
+                payload = data.getbuffer()   # zero-copy memoryview (BytesIO)
+            elif hasattr(data, 'getvalue'):
+                payload = data.getvalue()    # fallback: copy (shouldn't normally happen)
+            else:
+                payload = data               # already bytes/memoryview
+            payload_len = len(payload)
+            if payload_len >= self._MULTIPART_THRESHOLD:
+                # Use MultipartUploadWriter for large objects — sends multiple
+                # concurrent UploadPart requests instead of one giant single-part PUT.
+                # This is why minio-py is faster for 140 MB NPZ files.
+                logging.debug(f"put_data: s3dlio multipart upload {id} ({payload_len/1024/1024:.1f} MB, threshold={self._MULTIPART_THRESHOLD//1024//1024} MB)")
+                with self._s3dlio.MultipartUploadWriter.from_uri(id) as writer:
+                    writer.write(payload)
+            else:
+                self._s3dlio.put_bytes(id, payload)
         else:
             # s3torchconnector or minio - use S3Client API
             bucket_name, object_key = self._normalize_object_key(id)
@@ -351,9 +402,17 @@ class ObjStoreLibStorage(S3Storage):
 
     @dlp.log
     def get_data(self, id, data, offset=None, length=None):
+        logging.debug(f"get_data: lib={self.storage_library} id={id} offset={offset} length={length}")
         if self.storage_library == "s3dlio":
-            # Use s3dlio native API - simple get_bytes call
-            result = self._s3dlio.get_bytes(id)
+            # Use s3dlio native API:
+            #   get_range() for partial reads (server-side range request — saves bandwidth)
+            #   get()       for full object reads — returns BytesView (zero-copy Rust buffer)
+            if offset is not None and length is not None:
+                logging.debug(f"get_data: s3dlio.get_range({id}, offset={offset}, length={length})")
+                return self._s3dlio.get_range(id, offset=offset, length=length)
+            logging.debug(f"get_data: s3dlio.get({id})")
+            result = self._s3dlio.get(id)
+            logging.debug(f"get_data: s3dlio.get returned {len(result)} bytes")
             return result
         else:
             # s3torchconnector or minio - use S3Client API

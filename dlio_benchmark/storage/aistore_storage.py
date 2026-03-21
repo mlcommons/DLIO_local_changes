@@ -77,7 +77,7 @@ class AIStoreStorage(DataStorage):
 
         # Bucket name from namespace
         self.bucket_name = self.namespace.name
-        self.bucket = None
+        self._bucket = None
 
         logging.info(
             f"AIStore native storage initialized: endpoint={self.endpoint}, bucket=s3://{self.bucket_name}"
@@ -118,6 +118,13 @@ class AIStoreStorage(DataStorage):
 
         return key
 
+    @property
+    def bucket(self):
+        """Lazy-initialize and cache the AIStore bucket handle on first use."""
+        if self._bucket is None:
+            self._bucket = self.client.bucket(self.bucket_name)
+        return self._bucket
+
     @dlp.log
     def get_uri(self, id):
         """
@@ -129,7 +136,8 @@ class AIStoreStorage(DataStorage):
     @dlp.log
     def create_namespace(self, exist_ok=False):
         """Create AIStore bucket if it doesn't exist"""
-        self.bucket = self.client.bucket(self.bucket_name).create(exist_ok=exist_ok)
+        self._bucket = self.client.bucket(self.bucket_name)
+        self._bucket.create(exist_ok=exist_ok)
         return True
 
     @dlp.log
@@ -145,9 +153,6 @@ class AIStoreStorage(DataStorage):
     def get_node(self, id=""):
         """Check if object exists"""
         try:
-            if not self.bucket:
-                self.bucket = self.client.bucket(self.bucket_name)
-
             key = self._clean_key(id) if id else ""
 
             if not key:  # Check bucket
@@ -172,9 +177,6 @@ class AIStoreStorage(DataStorage):
         Returns just the filenames (relative to prefix) for DLIO compatibility.
         """
         try:
-            if not self.bucket:
-                self.bucket = self.client.bucket(self.bucket_name)
-
             prefix = self._clean_key(id) if id else ""
             objects = []
 
@@ -204,9 +206,6 @@ class AIStoreStorage(DataStorage):
     def delete_node(self, id):
         """Delete an object from AIStore"""
         try:
-            if not self.bucket:
-                self.bucket = self.client.bucket(self.bucket_name)
-
             key = self._clean_key(id)
             obj = self.bucket.object(key)
             obj.delete()
@@ -220,9 +219,6 @@ class AIStoreStorage(DataStorage):
     def put_data(self, id, data, offset=None, length=None):
         """Write data to AIStore object"""
         try:
-            if not self.bucket:
-                self.bucket = self.client.bucket(self.bucket_name)
-
             key = self._clean_key(id)
 
             obj = self.bucket.object(key)
@@ -240,9 +236,6 @@ class AIStoreStorage(DataStorage):
     def get_data(self, id, data, offset=None, length=None):
         """Read data from AIStore object"""
         try:
-            if not self.bucket:
-                self.bucket = self.client.bucket(self.bucket_name)
-
             key = self._clean_key(id)
             obj = self.bucket.object(key)
 
@@ -271,10 +264,9 @@ class AIStoreStorage(DataStorage):
     @dlp.log
     def isfile(self, id):
         """Check if object exists"""
-        key = self._clean_key(id)
-        obj = self.bucket.object(key)
         try:
-            obj.head()
+            key = self._clean_key(id)
+            self.bucket.object(key).head()
             return True
         except AISError:
             return False

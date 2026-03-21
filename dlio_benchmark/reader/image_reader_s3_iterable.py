@@ -15,45 +15,41 @@
    limitations under the License.
 """
 """
-NPY reader using parallel/streaming fetch from object storage.
+JPEG/PNG image reader using parallel prefetch from S3-compatible object storage.
+See _s3_iterable_mixin.py for the full design rationale.
 
-NPY files contain a single array (no named key), so decode is simply
-np.load(BytesIO(data)) rather than np.load(BytesIO(data))['x'].
+Each image file contains exactly one sample. Prefetch fetches the raw encoded bytes
+and stores only the byte count — no PIL or numpy decode is performed.
+DLIO's FormatReader.next() yields a pre-allocated random tensor regardless of file
+contents; only the byte count is needed for the image_size telemetry metric.
 
-Supported libraries:
-  s3dlio           — uses s3dlio.get_many() (parallel, up to 64 in-flight requests)
-  s3torchconnector — uses S3IterableDataset.from_objects() with sequential reader
-                     (single streaming GET per file via s3torchconnector's own API;
-                     no s3dlio dependency)
-  minio            — uses concurrent.futures.ThreadPoolExecutor with Minio SDK
-
-All objects assigned to this DLIO thread are prefetched before iteration begins.
-Note: listing is handled by ObjStoreLibStorage.list_objects(), which dispatches
-per library — each library (s3dlio, s3torchconnector, minio) handles its own
-listing independently. Delete is not yet implemented for object storage (no-op).
-
-Each library is STRICTLY isolated — there is NO silent fallback to another
-library. Configuring a library that is not installed raises ImportError immediately
-at construction time, not later during I/O.
+Supported libraries (strictly isolated, no cross-library fallback):
+  s3dlio           — s3dlio.get_many(), up to 64 parallel requests, O(1) len(BytesView)
+  s3torchconnector — S3IterableDataset.from_objects() + sequential reader
+  minio            — ThreadPoolExecutor + Minio SDK, pooled TCP connections
 """
+
 from dlio_benchmark.common.constants import MODULE_DATA_READER
-from dlio_benchmark.reader.npy_reader import NPYReader
+from dlio_benchmark.reader.image_reader import ImageReader
 from dlio_benchmark.reader._s3_iterable_mixin import _S3IterableMixin
-from dlio_benchmark.utils.utility import Profile, utcnow
+from dlio_benchmark.utils.utility import Profile, dft_ai, utcnow
 
 dlp = Profile(MODULE_DATA_READER)
 
 
-class NPYReaderS3Iterable(NPYReader, _S3IterableMixin):
+class ImageReaderS3Iterable(ImageReader, _S3IterableMixin):
     """
-    Parallel-prefetch NPY reader for S3-compatible object stores.
+    Parallel-prefetch JPEG/PNG reader for S3-compatible object stores.
 
     All prefetch, library routing, and byte-counting logic is in _S3IterableMixin.
     This class is a thin adapter connecting the mixin to DLIO's FormatReader chain.
 
-    NPY files contain one array per file (no named key). Each object maps to
-    exactly one sample; open_file_map[filename] holds the byte count (int) used
-    only for the image_size telemetry metric — no numpy decode is performed.
+    Images are 1 sample per file. open_file_map[filename] holds the raw byte count
+    (int) used only for telemetry. No PIL or numpy decode is performed.
+
+    ImageReader.get_sample() updates both dlp and dft_ai with image_size —
+    we replicate both calls here since we cannot call super().get_sample() (it
+    would try to call .nbytes on the cached int).
     """
 
     @dlp.log_init
@@ -62,7 +58,7 @@ class NPYReaderS3Iterable(NPYReader, _S3IterableMixin):
         opts = getattr(self._args, "storage_options", {}) or {}
         self._s3_init(opts)
         self.logger.info(
-            f"{utcnow()} NPYReaderS3Iterable [{self._storage_library}] "
+            f"{utcnow()} ImageReaderS3Iterable [{self._storage_library}] "
             f"thread={thread_index} epoch={epoch}"
         )
 
@@ -76,10 +72,12 @@ class NPYReaderS3Iterable(NPYReader, _S3IterableMixin):
 
     @dlp.log
     def get_sample(self, filename, sample_index):
-        # Report byte count for telemetry. Do NOT call super() — NPYReader.get_sample()
-        # does open_file_map[filename][..., sample_index].nbytes which would fail
-        # because open_file_map[filename] is now an int (byte count), not an array.
-        dlp.update(image_size=self._object_cache.get(filename, 0))
+        # Report byte count for both telemetry systems. Do NOT call super() —
+        # ImageReader.get_sample() calls open_file_map[filename].nbytes which would
+        # fail because open_file_map[filename] is now an int (byte count), not an array.
+        byte_count = self._object_cache.get(filename, 0)
+        dlp.update(image_size=byte_count)
+        dft_ai.update(image_size=byte_count)
 
     def next(self):
         self._s3_prefetch_all()

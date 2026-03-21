@@ -5,7 +5,14 @@ This README provides an abbreviated documentation of the DLIO code. Please refer
 
 ## Overview
 
-DLIO is an I/O benchmark for Deep Learning. DLIO is aimed at emulating the I/O behavior of various deep learning applications. The benchmark is delivered as an executable that can be configured for various I/O patterns. It uses a modular design to incorporate more data loaders, data formats, datasets, and configuration parameters. It emulates modern deep learning applications using Benchmark Runner, Data Generator, Format Handler, and I/O Profiler modules. 
+DLIO is an I/O benchmark for Deep Learning. DLIO is aimed at emulating the I/O behavior of various deep learning applications. The benchmark is delivered as an executable that can be configured for various I/O patterns. It uses a modular design to incorporate more data loaders, data formats, datasets, and configuration parameters. It emulates modern deep learning applications using Benchmark Runner, Data Generator, Format Handler, and I/O Profiler modules.
+
+DLIO supports multiple storage backends out of the box:
+- **Local filesystem** — the default, for NFS, Lustre, GPFS, and local NVMe
+- **AWS S3 / S3-compatible object storage** — via [s3dlio](https://github.com/russfellows/s3dlio), [s3torchconnector](https://github.com/awslabs/s3-connector-for-pytorch), or the [MinIO Python SDK](https://min.io/docs/minio/linux/developers/python/API.html)
+- **AIStore** — via the native AIStore Python SDK
+
+Object storage backends are configured through the `storage:` block in the workload YAML file (see [Object Storage Configuration](#object-storage-configuration) below).
 
 ## Installation and running DLIO
 ### Bare metal installation 
@@ -24,6 +31,23 @@ git clone https://github.com/argonne-lcf/dlio_benchmark
 cd dlio_benchmark/
 pip install .[aistore]
 ```
+
+### Bare metal installation with S3 / object storage support
+
+For S3-compatible object storage (AWS S3, MinIO, Vast Data, etc.) install one or more of the supported storage libraries alongside DLIO:
+
+```bash
+git clone https://github.com/argonne-lcf/dlio_benchmark
+cd dlio_benchmark/
+pip install .
+
+# Choose one (or more) S3 client libraries:
+pip install s3dlio                   # recommended — high-performance Rust-backed S3 client
+pip install s3torchconnector         # AWS S3 Connector for PyTorch (PyTorch only)
+pip install minio                    # MinIO Python SDK
+```
+
+The storage library to use is selected per-workload via `storage.storage_options.storage_library` in the YAML config (see [Object Storage Configuration](#object-storage-configuration)).
 
 ### Bare metal installation with profiler
 
@@ -150,6 +174,93 @@ checkpoint:
 
 The full list of configurations can be found in: https://argonne-lcf.github.io/dlio_benchmark/config.html
 
+---
+
+## Object Storage Configuration
+
+Object storage is enabled by adding a `storage:` block to the workload YAML.  The `storage_type: s3` value activates the S3 backend; a `storage_library` field selects the underlying client library.
+
+### Supported storage libraries
+
+| `storage_library` | Description | Framework support |
+|---|---|---|
+| `s3dlio` | High-performance Rust-backed client via [s3dlio](https://github.com/russfellows/s3dlio). Parallel GET, range optimization, multi-endpoint load balancing. | PyTorch + TensorFlow |
+| `s3torchconnector` | AWS S3 Connector for PyTorch — streaming single-file GET. | PyTorch only |
+| `minio` | MinIO Python SDK via `ThreadPoolExecutor`. | PyTorch + TensorFlow |
+
+### Example: UNet3D with S3 object storage
+
+```yaml
+# contents of unet3d_s3.yaml
+model:
+  name: unet3d
+  model_size: 499153191
+
+framework: pytorch
+
+workflow:
+  generate_data: False
+  train: True
+  checkpoint: False
+
+dataset:
+  data_folder: my-bucket/unet3d   # path within the bucket
+  format: npz
+  num_files_train: 168
+  num_samples_per_file: 1
+  record_length_bytes: 146600628
+  record_length_bytes_stdev: 68341808
+  record_length_bytes_resize: 2097152
+
+storage:
+  storage_type: s3
+  storage_root: my-bucket         # S3 bucket name
+  storage_library: s3dlio         # client library (s3dlio | s3torchconnector | minio)
+  storage_options:
+    endpoint_url: http://your-s3-host:9000   # omit for AWS; required for MinIO etc.
+    region: us-east-1
+    # Credentials come from environment variables:
+    #   export AWS_ACCESS_KEY_ID=...
+    #   export AWS_SECRET_ACCESS_KEY=...
+
+reader:
+  data_loader: pytorch
+  batch_size: 7
+  read_threads: 4
+  file_shuffle: seed
+  sample_shuffle: seed
+  # Required when using s3dlio with PyTorch multiprocessing:
+  multiprocessing_context: spawn
+
+train:
+  epochs: 5
+  computation_time: 0.323
+```
+
+### Running with object storage
+
+Set credentials via environment variables before running:
+
+```bash
+export AWS_ACCESS_KEY_ID=your-access-key
+export AWS_SECRET_ACCESS_KEY=your-secret-key
+export AWS_ENDPOINT_URL=http://your-s3-host:9000   # for non-AWS endpoints
+
+# Generate data into S3
+mpirun -np 8 dlio_benchmark workload=unet3d_s3 ++workload.workflow.generate_data=True ++workload.workflow.train=False
+
+# Run benchmark from S3
+mpirun -np 8 dlio_benchmark workload=unet3d_s3
+```
+
+Pre-built S3 workload configs matching MLPerf Storage GPU profiles are available in [dlio_benchmark/configs/workload/](./dlio_benchmark/configs/workload/) (e.g. `unet3d_h100_s3.yaml`, `unet3d_a100_s3.yaml`, `unet3d_v100_s3.yaml`).
+
+### Timing correctness with object storage
+
+The training loop timing is **not affected** by switching to object storage. The measurement sequence (`start_loading` → batch delivery → `batch_loaded` → GPU sleep → `batch_processed`) is identical to local filesystem runs. Object storage I/O happens inside PyTorch DataLoader worker processes during the GPU computation sleep, exactly as local file reads do. See [docs/DLIO-Object-Storage_Analysis.md](./docs/DLIO-Object-Storage_Analysis.md) for a detailed analysis.
+
+---
+
 The YAML file is loaded through hydra (https://hydra.cc/). The default setting are overridden by the configurations loaded from the YAML file. One can override the configuration through command line (https://hydra.cc/docs/advanced/override_grammar/basic/). 
 
 ## Current Limitations and Future Work
@@ -160,7 +271,7 @@ The YAML file is loaded through hydra (https://hydra.cc/). The default setting a
 
 * File format support: we only support tfrecord, hdf5, npz, csv, jpg, jpeg formats. Other data formats can be extended.
 
-* Storage backend support: we support local filesystem, AWS S3, and AIStore as storage backends. Other storage backends can be extended.
+* Storage backend support: we support local filesystem (`local_fs`), AWS S3 and S3-compatible object stores (`s3`), and AIStore (`aistore`). For S3 storage, three client libraries are available: [s3dlio](https://github.com/russfellows/s3dlio) (recommended), [s3torchconnector](https://github.com/awslabs/s3-connector-for-pytorch) (PyTorch only), and the [MinIO SDK](https://min.io/docs/minio/linux/developers/python/API.html). Other storage backends can be extended.
 
 * Data Loader support: we support reading datasets using TensorFlow tf.data data loader, PyTorch DataLoader, and a set of custom data readers implemented in ./reader. For TensorFlow tf.data data loader, PyTorch DataLoader  
   - We have complete support for tfrecord format in TensorFlow data loader. 

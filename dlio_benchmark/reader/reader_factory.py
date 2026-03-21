@@ -56,6 +56,15 @@ class ReaderFactory(object):
             elif _args.data_loader == DataLoaderType.NATIVE_DALI:
                 from dlio_benchmark.reader.dali_image_reader import DaliImageReader
                 return DaliImageReader(dataset_type, thread_index, epoch_number)
+            # Use S3 readers for both S3 and AIStore
+            elif _args.storage_type in (StorageType.S3, StorageType.AISTORE):
+                storage_library = (getattr(_args, "storage_options", {}) or {}).get("storage_library")
+                if storage_library in ("s3dlio", "s3torchconnector", "minio"):
+                    from dlio_benchmark.reader.image_reader_s3_iterable import ImageReaderS3Iterable
+                    return ImageReaderS3Iterable(dataset_type, thread_index, epoch_number)
+                # Fallthrough: unrecognized library — let ImageReader try (will fail with a clear PIL error)
+                from dlio_benchmark.reader.image_reader import ImageReader
+                return ImageReader(dataset_type, thread_index, epoch_number)
             else:
                 from dlio_benchmark.reader.image_reader import ImageReader
                 return ImageReader(dataset_type, thread_index, epoch_number)   
@@ -126,9 +135,12 @@ class ReaderFactory(object):
         elif type == FormatType.PARQUET:
             if _args.odirect == True:
                 raise Exception("O_DIRECT for %s format is not yet supported." %type)
-            else:
+            elif _args.storage_type in (StorageType.S3, StorageType.AISTORE):
                 from dlio_benchmark.reader.parquet_reader_s3_iterable import ParquetReaderS3Iterable
                 return ParquetReaderS3Iterable(dataset_type, thread_index, epoch_number)
+            else:
+                from dlio_benchmark.reader.parquet_reader import ParquetReader
+                return ParquetReader(dataset_type, thread_index, epoch_number)
 
         else:
             raise Exception("Loading data of %s format is not supported without framework data loader" %type)

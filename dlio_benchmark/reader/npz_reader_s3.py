@@ -26,7 +26,7 @@ dlp = Profile(MODULE_DATA_READER)
 
 class NPZReaderS3(NPZReader):
     """
-    Reader for NPZ files using S3 protocol
+    Reader for NPZ objects stored in S3-compatible object storage.
     """
 
     @dlp.log_init

@@ -44,9 +44,9 @@ class NPZGenerator(DataGenerator):
         for i in dlp.iter(range(self.my_rank, int(self.total_files_to_generate), self.comm_size)):
             dim_ = dim[2*i]
             if isinstance(dim_, list):
-                records = gen_random_tensor(shape=(*dim_, self.num_samples), dtype=self._args.record_element_dtype, rng=rng)
+                records = gen_random_tensor(shape=(*dim_, self.num_samples), dtype=self._args.record_element_dtype, rng=rng, writeable=False)
             else:
-                records = gen_random_tensor(shape=(dim_, dim[2*i+1], self.num_samples), dtype=self._args.record_element_dtype, rng=rng)
+                records = gen_random_tensor(shape=(dim_, dim[2*i+1], self.num_samples), dtype=self._args.record_element_dtype, rng=rng, writeable=False)
             out_path_spec = self.storage.get_uri(self._file_list[i])
             progress(i+1, self.total_files_to_generate, "Generating NPZ Data")
             output = out_path_spec if self.storage.islocalfs() else io.BytesIO()
@@ -55,5 +55,5 @@ class NPZGenerator(DataGenerator):
             else:
                 np.savez_compressed(output, x=records, y=record_labels)
             if not self.storage.islocalfs():
-                self.storage.put_data(out_path_spec, output.getvalue())
+                self.storage.put_data(out_path_spec, output)
         np.random.seed()

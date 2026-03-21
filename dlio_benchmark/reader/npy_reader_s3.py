@@ -28,7 +28,7 @@ dlp = Profile(MODULE_DATA_READER)
 
 class NPYReaderS3(NPYReader):
     """
-    Reader for NPY files using S3 protocol
+    Reader for NPY objects stored in S3-compatible object storage.
     """
 
     @dlp.log_init

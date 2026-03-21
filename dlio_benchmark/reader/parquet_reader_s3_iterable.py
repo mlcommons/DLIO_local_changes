@@ -25,7 +25,9 @@ file downloads.
 
 Supported storage libraries
   s3dlio           — uses s3dlio.get_range(uri, offset, length) and s3dlio.stat(uri)
-  s3torchconnector — same as s3dlio (uses s3dlio as the underlying engine)
+  s3torchconnector — uses S3Client.get_object() with S3ReaderConstructor.range_based()
+                     for native byte-range GETs; object size via HeadObjectResult.
+                     No s3dlio dependency. Requires s3torchconnector >= 1.3.0.
   minio            — uses minio.Minio.get_object(bucket, key, offset=, length=)
 
 Configuration (under storage_options in the DLIO YAML):
@@ -48,6 +50,7 @@ Example YAML snippet:
 """
 import bisect
 import os
+from urllib.parse import urlparse
 
 from dlio_benchmark.common.constants import MODULE_DATA_READER
 from dlio_benchmark.reader.reader_handler import FormatReader
@@ -63,9 +66,8 @@ class _S3RangeFile:
     """
     Seekable, readable file-like object backed by s3dlio byte-range GETs.
 
-    Used for both s3dlio and s3torchconnector (s3dlio is the underlying engine
-    in both cases). pyarrow.parquet.ParquetFile passes this to its C++ reader
-    which calls seek/tell/read as needed when scanning column chunks.
+    Used for s3dlio only. pyarrow.parquet.ParquetFile passes this to its C++
+    reader which calls seek/tell/read as needed when scanning column chunks.
     """
 
     def __init__(self, uri: str):
@@ -204,7 +206,7 @@ class ParquetReaderS3Iterable(FormatReader):
     """
     Row-group-granular Parquet reader for S3-compatible object storage.
 
-    Opens parquet files by reading only the footer (column / row-group metadata)
+    Opens parquet objects by reading only the footer (column / row-group metadata)
     via a small range request, then fetches individual row groups on demand as
     DLIO requests specific sample indices.  Row groups are cached (LRU-bounded)
     so that consecutive samples from the same row group incur only one network
@@ -236,18 +238,54 @@ class ParquetReaderS3Iterable(FormatReader):
         # Optional column selection (list[str] or None = all columns)
         self._columns = opts.get("columns") or None
 
-        # Row-group cache: (filename, rg_idx) → (pyarrow.Table, nbytes)
+        # Row-group cache: (obj_key, rg_idx) → (pyarrow.Table, nbytes)
         self._rg_cache_size = int(opts.get("row_group_cache_size", 4))
         self._rg_cache: dict = {}
         self._rg_lru: list = []  # insertion-order LRU key list
 
-        # Configure s3dlio endpoint at construction time
-        if self._storage_library in ("s3dlio", "s3torchconnector"):
+        # s3dlio reads AWS_ENDPOINT_URL_S3 at runtime; set it early if needed.
+        if self._storage_library == "s3dlio":
             ep = opts.get("endpoint_url")
             if ep and not os.environ.get("AWS_ENDPOINT_URL_S3"):
                 os.environ["AWS_ENDPOINT_URL_S3"] = ep
 
-        # Minio client created lazily once, reused across files
+        # s3torchconnector: fail immediately if the library is missing or too old.
+        # Parquet reading requires byte-range GETs via S3ReaderConstructor.range_based().
+        # There is NO silent fallback to s3dlio or any other library.
+        self._s3torch_client = None
+        if self._storage_library == "s3torchconnector":
+            try:
+                from s3torchconnector._s3client import (
+                    S3Client as _S3TCClient,
+                    S3ClientConfig as _S3TCConfig,
+                )
+                from s3torchconnector import S3ReaderConstructor as _S3TCReaderConstructor
+                # Verify range_based() exists — requires s3torchconnector >= 1.3.0
+                if not hasattr(_S3TCReaderConstructor, "range_based"):
+                    raise RuntimeError(
+                        "ParquetReaderS3Iterable: s3torchconnector is too old. "
+                        "S3ReaderConstructor.range_based() is required for Parquet "
+                        "byte-range reads. Upgrade: pip install --upgrade s3torchconnector"
+                    )
+            except ImportError as exc:
+                raise ImportError(
+                    "ParquetReaderS3Iterable: storage_library='s3torchconnector' requires "
+                    "the s3torchconnector package (>= 1.3.0). "
+                    "Install with: pip install s3torchconnector"
+                ) from exc
+            ep = opts.get("endpoint_url") or os.environ.get("AWS_ENDPOINT_URL")
+            region = opts.get("region", "us-east-1")
+            self._s3torch_client = _S3TCClient(
+                region=region,
+                endpoint=ep or None,
+                s3client_config=_S3TCConfig(),
+            )
+            self.logger.info(
+                f"{utcnow()} ParquetReaderS3Iterable: s3torchconnector S3Client ready, "
+                f"endpoint={ep!r} region={region!r}"
+            )
+
+        # Minio client created lazily once, reused across objects
         self._minio_client = None
 
         self.logger.info(
@@ -258,12 +296,12 @@ class ParquetReaderS3Iterable(FormatReader):
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
-    def _uri_for_filename(self, filename: str) -> str:
-        """Return a full s3:// URI for a DLIO filename (relative or absolute)."""
-        if "://" in filename:
-            return filename
+    def _uri_for_obj_key(self, obj_key: str) -> str:
+        """Return a full s3:// URI for a DLIO object key (relative or absolute)."""
+        if "://" in obj_key:
+            return obj_key
         root = self._args.storage_root.rstrip("/")
-        return f"s3://{root}/{filename.lstrip('/')}"
+        return f"s3://{root}/{obj_key.lstrip('/')}"
 
     def _get_minio_client(self):
         if self._minio_client is None:
@@ -287,14 +325,25 @@ class ParquetReaderS3Iterable(FormatReader):
         return self._minio_client
 
     def _make_range_file(self, filename: str):
-        """Create a seekable file-like object for the given filename."""
-        uri = self._uri_for_filename(filename)
+        """Create a seekable file-like I/O adapter for the given object key."""
+        uri = self._uri_for_obj_key(filename)
         lib = self._storage_library
-        if lib in ("s3dlio", "s3torchconnector"):
+        if lib == "s3dlio":
             return _S3RangeFile(uri)
+        elif lib == "s3torchconnector":
+            # Use s3torchconnector's native range-based reader directly.
+            # RangedS3Reader (returned by get_object with range_based constructor)
+            # is an io.BufferedIOBase that fully supports seek/tell/read/readinto,
+            # including SEEK_END — no s3dlio dependency whatsoever.
+            from s3torchconnector import S3ReaderConstructor
+            parsed = urlparse(uri)
+            bucket = parsed.netloc
+            key = parsed.path.lstrip("/")
+            reader_constructor = S3ReaderConstructor.range_based()
+            return self._s3torch_client.get_object(
+                bucket=bucket, key=key, reader_constructor=reader_constructor
+            )
         elif lib == "minio":
-            from urllib.parse import urlparse
-
             parsed = urlparse(uri)
             bucket = parsed.netloc
             key = parsed.path.lstrip("/")
@@ -341,7 +390,7 @@ class ParquetReaderS3Iterable(FormatReader):
 
     @dlp.log
     def close(self, filename):
-        """Evict cached row groups for this file to free memory."""
+        """Evict cached row groups for this object to free memory."""
         keys_to_remove = [k for k in self._rg_cache if k[0] == filename]
         for k in keys_to_remove:
             self._rg_cache.pop(k, None)

@@ -348,11 +348,8 @@ class ConfigArguments:
         if len(self.record_dims) > 0 and self.record_length_stdev > 0:
             raise ValueError("Both record_dims and record_length_bytes_stdev are set. This is not supported. If you need stdev on your records, please specify record_length_bytes with record_length_bytes_stdev instead.")
 
-        # AIStore specific checks (uses S3 generators/readers)
-        if self.storage_type == StorageType.AISTORE and self.framework == FrameworkType.PYTORCH:
-            if self.format not in (FormatType.NPZ, FormatType.NPY):
-                raise Exception(f"For AIStore using PyTorch framework, only NPZ or NPY formats are supported. Got format {self.format}")
-            
+        # AIStore specific checks
+        if self.storage_type == StorageType.AISTORE:
             # Validate that aistore SDK is available (check module-level flag
             # so mock-based tests can patch AISTORE_AVAILABLE without the real SDK)
             from dlio_benchmark.storage import aistore_storage as _ais_mod
@@ -361,22 +358,6 @@ class ConfigArguments:
                     "The aistore package is required for AIStore storage but is not installed. "
                     "Install it with: pip install aistore"
                 )
-            
-            # AIStore uses S3 generators/readers, so validate those exist
-            if self.format == FormatType.NPY:
-                try:
-                    from dlio_benchmark.reader.npy_reader_s3 import NPYReaderS3
-                except ImportError:
-                    raise Exception(
-                        "AIStore with NPY requires dlio_benchmark.reader.npy_reader_s3.NPYReaderS3"
-                    )
-            elif self.format == FormatType.NPZ:
-                try:
-                    from dlio_benchmark.reader.npz_reader_s3 import NPZReaderS3
-                except ImportError:
-                    raise Exception(
-                        "AIStore with NPZ requires dlio_benchmark.reader.npz_reader_s3.NPZReaderS3"
-                    )
 
         # S3 specific checks — all branches are storage_library-aware.
         # storage_type=s3 means "object storage"; storage_library selects which
@@ -471,17 +452,21 @@ class ConfigArguments:
                         "but it could not be imported. Ensure the module is available."
                     )
 
-            # Validate required credentials are present in storage_options
+            # Validate required credentials are present in storage_options OR
+            # as standard AWS environment variables (AWS_ACCESS_KEY_ID, etc.).
+            # s3dlio and minio can both read standard AWS_ env vars natively,
+            # so we don't require them to be duplicated in storage_options.
+            opts = self.storage_options or {}
             missing = []
-            access_key_id = (self.storage_options or {}).get("access_key_id")
+            access_key_id = opts.get("access_key_id") or os.environ.get("AWS_ACCESS_KEY_ID")
             if not access_key_id:
-                missing.append("storage_options['access_key_id']")
-            secret_access_key = (self.storage_options or {}).get("secret_access_key")
+                missing.append("storage_options['access_key_id'] or AWS_ACCESS_KEY_ID env var")
+            secret_access_key = opts.get("secret_access_key") or os.environ.get("AWS_SECRET_ACCESS_KEY")
             if not secret_access_key:
-                missing.append("storage_options['secret_access_key']")
-            endpoint = (self.storage_options or {}).get("endpoint_url")
+                missing.append("storage_options['secret_access_key'] or AWS_SECRET_ACCESS_KEY env var")
+            endpoint = opts.get("endpoint_url") or os.environ.get("AWS_ENDPOINT_URL")
             if not endpoint:
-                missing.append("storage_options['endpoint_url']")
+                missing.append("storage_options['endpoint_url'] or AWS_ENDPOINT_URL env var")
             if missing:
                 raise Exception(
                     f"Missing required S3 credentials for storage_library={storage_library}: "
@@ -495,28 +480,38 @@ class ConfigArguments:
 
     @dlp.log
     def derive_configurations(self, file_list_train=None, file_list_eval=None):
-        # Initialize data generation method from config or environment
+        # Initialize data generation method from config or environment.
+        # DEFAULT IS DGEN — not 'auto'. There is no silent fallback to numpy.
+        # To explicitly use numpy (comparison benchmarks only): DLIO_DATA_GEN=numpy
         if self.data_gen_method is None:
-            self.data_gen_method = os.environ.get('DLIO_DATA_GEN', 'auto')
-        
-        # Log data generation method selection
-        from dlio_benchmark.utils.utility import HAS_DGEN
-        method = self.data_gen_method.lower()
-        if method == 'numpy' or (method in ['auto', 'dgen'] and not HAS_DGEN):
-            self.logger.output(f"{'='*80}")
-            self.logger.output(f"Data Generation Method: NUMPY (Legacy)")
-            self.logger.output(f"  Using NumPy random generation (155x slower than dgen-py)")
-            if method == 'dgen':
-                self.logger.output(f"  Note: dgen-py requested but not installed")
-                self.logger.output(f"  Install with: pip install dgen-py")
-            self.logger.output(f"  Set DLIO_DATA_GEN=dgen or dataset.data_gen_method=dgen for speedup")
-            self.logger.output(f"{'='*80}")
-        else:
-            self.logger.output(f"{'='*80}")
-            self.logger.output(f"Data Generation Method: DGEN (Optimized)")
-            self.logger.output(f"  Using dgen-py with zero-copy BytesView (155x faster, 0MB overhead)")
-            self.logger.output(f"  Set DLIO_DATA_GEN=numpy or dataset.data_gen_method=numpy for legacy mode")
-            self.logger.output(f"{'='*80}")
+            self.data_gen_method = os.environ.get('DLIO_DATA_GEN', 'dgen')
+
+        # Log data generation method selection — only relevant when actually generating data
+        # (datagen or checkpoint workloads). Skip during training-only runs to avoid confusion.
+        if self.generate_data or self.do_checkpoint:
+            from dlio_benchmark.utils.utility import HAS_DGEN
+            method = self.data_gen_method.lower()
+            if method == 'numpy':
+                # Only reachable via explicit DLIO_DATA_GEN=numpy — warn loudly.
+                self.logger.output(f"{'='*80}")
+                self.logger.output(f"WARNING: Data Generation Method: NUMPY (Slow Legacy Path)")
+                self.logger.output(f"  Using NumPy random generation — 155x SLOWER than dgen-py")
+                self.logger.output(f"  This path is for explicit comparison benchmarks ONLY.")
+                self.logger.output(f"  Remove DLIO_DATA_GEN=numpy to restore dgen-py (default).")
+                self.logger.output(f"{'='*80}")
+            elif not HAS_DGEN:
+                # dgen is the default but dgen-py is not installed — fail immediately
+                # rather than silently degrading to numpy in every MPI rank.
+                raise RuntimeError(
+                    "dgen-py is required but not installed.\n"
+                    "Install with: pip install dgen-py\n"
+                    "To use the slow NumPy fallback explicitly: DLIO_DATA_GEN=numpy"
+                )
+            else:
+                self.logger.output(f"{'='*80}")
+                self.logger.output(f"Data Generation Method: DGEN (default)")
+                self.logger.output(f"  dgen-py zero-copy BytesView — 155x faster than NumPy, 0 MB overhead")
+                self.logger.output(f"{'='*80}")
         
         if self.checkpoint_mechanism == CheckpointMechanismType.NONE:
             if self.framework == FrameworkType.TENSORFLOW:
@@ -721,6 +716,8 @@ class ConfigArguments:
                     np.random.seed(self.seed)
                 np.random.shuffle(self.file_list_train) 
                 np.random.shuffle(self.file_list_eval)
+        local_train_sample_sum = 0
+        local_eval_sample_sum = 0
         if self.data_loader_sampler == DataLoaderSampler.ITERATIVE:
             self.train_file_map, local_train_sample_sum = self.build_sample_map_iter(self.file_list_train, self.total_samples_train,
                                                              epoch_number)
@@ -1359,3 +1356,5 @@ def LoadConfig(args, config):
     if 'metric' in config:
         if 'au' in config['metric']:
             args.au = config['metric']['au']
+
+

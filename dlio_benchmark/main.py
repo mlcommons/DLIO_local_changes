@@ -69,6 +69,21 @@ class DLIOBenchmark(object):
         t0 = time()
         self.args = ConfigArguments.get_instance()
         LoadConfig(self.args, cfg)
+
+        print(f"[DEBUG DLIOBenchmark.__init__] After LoadConfig:")
+        print(f"  storage_type   = {self.args.storage_type!r}")
+        print(f"  storage_root   = {self.args.storage_root!r}")
+        print(f"  storage_options= {self.args.storage_options!r}")
+        print(f"  data_folder    = {self.args.data_folder!r}")
+        print(f"  framework      = {self.args.framework!r}")
+        print(f"  num_files_train= {self.args.num_files_train!r}")
+        print(f"  record_length  = {self.args.record_length!r}")
+        print(f"  generate_data  = {self.args.generate_data!r}")
+        print(f"  do_train       = {self.args.do_train!r}")
+        print(f"  do_checkpoint  = {self.args.do_checkpoint!r}")
+        print(f"  epochs         = {self.args.epochs!r}")
+        print(f"  batch_size     = {self.args.batch_size!r}")
+
         self.storage = StorageFactory().get_storage(self.args.storage_type, self.args.storage_root,
                                                     self.args.framework)
 
@@ -180,13 +195,14 @@ class DLIOBenchmark(object):
                     num_subfolders = self.num_subfolders_train
                 else:
                     num_subfolders = self.num_subfolders_eval
-                filenames = self.storage.walk_node(os.path.join(self.args.data_folder, f"{dataset_type}"))
+                walk_path = os.path.join(self.args.data_folder, f"{dataset_type}")
+                filenames = self.storage.walk_node(walk_path)
                 self.logger.debug(f"filenames {filenames} {num_subfolders}")
                 if (len(filenames) == 0):
                     continue
+                check_path = os.path.join(self.args.data_folder, f"{dataset_type}", filenames[0])
                 if self.storage.get_node(
-                        os.path.join(self.args.data_folder, f"{dataset_type}",
-                                    filenames[0])) == MetadataType.DIRECTORY:
+                        check_path) == MetadataType.DIRECTORY:
                     assert (num_subfolders == len(filenames))
                     fullpaths = self.storage.walk_node(
                         os.path.join(self.args.data_folder, f"{dataset_type}/*/*.{self.args.format}"),

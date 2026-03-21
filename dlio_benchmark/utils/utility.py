@@ -331,47 +331,54 @@ def sleep(config):
         base_sleep(sleep_time)
     return sleep_time
 
-def gen_random_tensor(shape, dtype, rng=None, method=None):
+def gen_random_tensor(shape, dtype, rng=None, method=None, writeable=True):
     """Generate random tensor data for DLIO benchmarks.
-    
-    Supports two data generation methods:
-    - 'dgen': Uses dgen-py with zero-copy BytesView (155x faster, default if available)
-    - 'numpy': Uses NumPy random generation (legacy method for comparison)
-    
-    Method selection (in priority order):
-    1. Explicit 'method' parameter (if provided)
-    2. DLIO_DATA_GEN environment variable ('dgen' or 'numpy')
-    3. Auto-detect: Use dgen-py if installed, else NumPy
-    
+
+    DEFAULT: dgen-py (high-performance Rust-backed random data, zero-copy BytesView).
+    This is 155x faster than NumPy and uses no extra memory during generation.
+
+    The only supported methods are:
+    - 'dgen'  : dgen-py (default). Fails hard if dgen-py is not installed.
+    - 'numpy' : NumPy random generation. Slow legacy path — only use for explicit
+                comparison benchmarks. Set DLIO_DATA_GEN=numpy to activate.
+
+    'auto' is intentionally NOT a supported default: silent fallback to numpy is
+    a footgun — callers would get 155x slower generation without any indication.
+
     Args:
-        shape: Tuple specifying tensor dimensions
-        dtype: NumPy dtype for the output array
-        rng: Optional NumPy random generator (only used for NumPy method)
-        method: Optional override for generation method ('dgen' or 'numpy')
-    
-    Returns:
-        NumPy array with random data
+        shape:     Tuple specifying tensor dimensions.
+        dtype:     NumPy dtype for the output array.
+        rng:       Optional NumPy Generator (only used for the numpy slow path).
+        method:    Explicit method override ('dgen' or 'numpy'). If None, reads
+                   DLIO_DATA_GEN from the environment (default: 'dgen').
+        writeable: If False, skip the extra .copy() in the dgen path, saving one
+                   full array allocation. Safe when the caller only reads the array
+                   (e.g. np.savez). npz_generator passes writeable=False.
     """
-    # Determine which method to use
+    # ── Method selection ────────────────────────────────────────────────────────
+    # Default is 'dgen'. The environment can override to 'numpy' for explicit
+    # comparison runs, but there is NO silent auto-fallback. If dgen-py is not
+    # installed and 'dgen' is requested, we raise immediately rather than
+    # silently producing correct-but-vastly-slower results.
     if method is None:
-        method = os.environ.get('DLIO_DATA_GEN', 'auto').lower()
-    
+        method = os.environ.get('DLIO_DATA_GEN', 'dgen').lower()
+
     method = method.lower()
-    
-    # Force numpy mode if requested, or if dgen not available
-    use_dgen = (method in ['auto', 'dgen']) and HAS_DGEN
-    
+
+    use_dgen = (method == 'dgen')
+
     if method == 'numpy':
+        # Explicit numpy request — allowed for comparison benchmarks only.
         use_dgen = False
-    elif method == 'dgen' and not HAS_DGEN:
-        # User explicitly requested dgen but it's not available - warn
-        import warnings
-        warnings.warn(
-            "dgen-py requested but not installed. Install with: pip install dgen-py "
-            "Falling back to NumPy (155x slower).",
-            RuntimeWarning
+    elif use_dgen and not HAS_DGEN:
+        # Hard failure: dgen was requested (the default) but dgen-py is not installed.
+        # We do NOT fall back to numpy — that would silently degrade performance by
+        # 155x with no visible warning in production MPI runs.
+        raise RuntimeError(
+            "dgen-py is required but not installed.\n"
+            "Install with: pip install dgen-py\n"
+            "To use the slow NumPy fallback explicitly: DLIO_DATA_GEN=numpy"
         )
-        use_dgen = False
     
     # Fast path: Use dgen-py with ZERO-COPY BytesView (155x faster than NumPy)
     if use_dgen:
@@ -390,8 +397,12 @@ def gen_random_tensor(shape, dtype, rng=None, method=None):
         # np.frombuffer on BytesView is zero-copy because BytesView implements buffer protocol
         arr = np.frombuffer(bytesview, dtype=dtype).reshape(shape)
         
-        # Make writable copy (required for some use cases)
-        return arr.copy()
+        # Make writable copy only if needed. The read-only view is valid and safe
+        # when the caller only reads the array (e.g. np.savez). Pass writeable=False
+        # to skip the copy and save one full array allocation.
+        if writeable:
+            return arr.copy()
+        return arr
     
     # Slow path: NumPy random generation (legacy method)
     if rng is None:
