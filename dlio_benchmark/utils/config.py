@@ -646,7 +646,10 @@ class ConfigArguments:
             # OPTIMIZATION 1: Cache os.path.abspath() results per file (not per sample)
             # This reduces 4.3B filesystem calls to just 1024 calls
             cache_start = time.time()
-            abs_path_cache = {i: os.path.abspath(file_list[i]) for i in range(num_files)}
+            if self.storage_type == StorageType.LOCAL_FS:
+                abs_path_cache = {i: os.path.abspath(file_list[i]) for i in range(end_sample - start_sample + 1)}
+            else:
+                abs_path_cache = {i: file_list[i] for i in range(end_sample - start_sample + 1)}
             cache_time = time.time() - cache_start
             self.logger.info(f"Built abs_path_cache for {num_files} files in {cache_time:.4f}s")
             
