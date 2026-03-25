@@ -156,14 +156,18 @@ class ObjStoreLibStorage(S3Storage):
         logging.debug(f"  env AWS_ENDPOINT_URL_S3={os.environ.get('AWS_ENDPOINT_URL_S3', '<not set>')!r}")
         logging.debug(f"  env AWS_ACCESS_KEY_ID={'<set>' if os.environ.get('AWS_ACCESS_KEY_ID') else '<not set>'}")
 
-        # Get storage library selection (default to s3torchconnector for backward compatibility).
-        # This value must flow from config.py via storage_options — never read from
-        # raw environment variables so that config.py is the single source of truth.
-        if "storage_library" in storage_options:
-            storage_library = storage_options["storage_library"]
-        else:
-            storage_library = "s3torchconnector"  # default (mlp-storage/dlio_benchmark/config.py
-            # must inject storage.storage_library into storage_options for non-default libs)
+        # Get storage library selection.
+        # storage_library is REQUIRED — there is no default.  This value flows
+        # from config.py via storage_options; it must be set explicitly in every
+        # object storage workload YAML (storage_library: <value>) or on the CLI
+        # (storage.storage_options.storage_library=<value>).
+        storage_library = storage_options.get("storage_library")
+        if storage_library is None:
+            raise ValueError(
+                "storage_options['storage_library'] is required for ObjStoreLibStorage. "
+                "Add 'storage_library: <value>' under the 'storage:' section of your "
+                "workload YAML.  Supported values: minio, s3dlio, s3torchconnector."
+            )
         self.storage_library = storage_library
         
         logging.debug(f"ObjStoreLibStorage: using storage library: {storage_library}")
@@ -179,15 +183,16 @@ class ObjStoreLibStorage(S3Storage):
         self.endpoint = storage_options.get("endpoint_url") or os.environ.get("AWS_ENDPOINT_URL")
         self.region = storage_options.get("region") or os.environ.get("AWS_REGION") or getattr(self._args, "s3_region", "us-east-1")
 
-        if logging.isEnabledFor(logging.DEBUG):
+        _log = logging.getLogger(__name__)
+        if _log.isEnabledFor(logging.DEBUG):
             src_key = "storage_options" if storage_options.get("access_key_id") else "AWS_ACCESS_KEY_ID env"
             src_sec = "storage_options" if storage_options.get("secret_access_key") else "AWS_SECRET_ACCESS_KEY env"
             src_ep  = "storage_options" if storage_options.get("endpoint_url") else "AWS_ENDPOINT_URL env"
-            logging.debug("ObjStoreLibStorage: credentials/endpoint resolved (storage_options → env fallback):")
-            logging.debug(f"  access_key_id  = {'<set> [' + src_key + ']' if self.access_key_id else '<MISSING — set AWS_ACCESS_KEY_ID>'}")
-            logging.debug(f"  secret_key     = {'<set> [' + src_sec + ']' if self.secret_access_key else '<MISSING — set AWS_SECRET_ACCESS_KEY>'}")
-            logging.debug(f"  endpoint_url   = {self.endpoint!r}  [{src_ep}]")
-            logging.debug(f"  region         = {self.region!r}")
+            _log.debug("ObjStoreLibStorage: credentials/endpoint resolved (storage_options → env fallback):")
+            _log.debug(f"  access_key_id  = {'<set> [' + src_key + ']' if self.access_key_id else '<MISSING — set AWS_ACCESS_KEY_ID>'}")
+            _log.debug(f"  secret_key     = {'<set> [' + src_sec + ']' if self.secret_access_key else '<MISSING — set AWS_SECRET_ACCESS_KEY>'}")
+            _log.debug(f"  endpoint_url   = {self.endpoint!r}  [{src_ep}]")
+            _log.debug(f"  region         = {self.region!r}")
 
         # URI scheme for object storage addressing.
         # s3dlio supports multiple schemes: "s3", "az", "gs", "file", etc.

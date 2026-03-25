@@ -26,8 +26,8 @@ mlpstorage.checkpointing.StreamingCheckpointing producer-consumer pipeline:
 
   • save_state() sums the per-placeholder byte counts, then calls
     StreamingCheckpointing.save(uri, total_bytes).  dgen-py generates
-    synthetic random data of the same byte count while the backend (minio or
-    s3dlio) streams it to the object store.  Peak RAM ≈ 128 MB (4 × 32 MB
+    synthetic random data of the same byte count while the storage library
+    (minio, s3dlio, or s3torchconnector) streams it to the object store.  Peak RAM ≈ 128 MB (4 × 32 MB
     buffer pool).
 
   • load_state() computes the expected byte count from the same placeholders
@@ -98,7 +98,18 @@ class PyTorchObjStoreCheckpointing(PyTorchCheckpointing):
         BaseCheckpointing.__init__(self, "pt")
 
         storage_options = getattr(self.args, "storage_options", {}) or {}
-        self.storage_library  = storage_options.get("storage_library", "minio")
+        # storage_library is REQUIRED — there is no default.  Every object storage
+        # workload must explicitly declare which library to use via
+        # storage_options["storage_library"] (set by storage_library: in the YAML
+        # or via storage.storage_options.storage_library=<value> on the CLI).
+        self.storage_library = storage_options.get("storage_library")
+        if self.storage_library is None:
+            raise ValueError(
+                "storage_options['storage_library'] is required for "
+                "PyTorchObjStoreCheckpointing. Add 'storage_library: <value>' "
+                "under the 'storage:' section of your workload YAML. "
+                "Supported values: minio, s3dlio, s3torchconnector."
+            )
         self.access_key_id    = storage_options.get("access_key_id")
         self.secret_access_key = storage_options.get("secret_access_key")
         self.endpoint         = storage_options.get("endpoint_url")
@@ -176,12 +187,42 @@ class PyTorchObjStoreCheckpointing(PyTorchCheckpointing):
                 num_parallel_uploads=max(2, 8 // _mpi_world_size),
             )
         elif self.storage_library == "s3dlio":
-            # s3dlio uses a Rust/Tokio runtime per writer subprocess; each
-            # runtime spawns O(N-CPU) threads.  Throttle max_in_flight so that
-            # total concurrent uploads = world_size × max_in_flight stays
-            # reasonable (target ≤ 16 total for a single storage backend).
+            # s3dlio multipart upload tuning.
+            #
+            # Background (v0.9.82 regression):
+            #   spawn_part() acquires the concurrency semaphore *before* spawning the
+            #   upload task, blocking the Python writer thread until a slot is free.
+            #   This prevents an OOM/runtime-overload bug (pre-v0.9.82 code spawned all
+            #   parts simultaneously — ~467 tasks × 32 MB = ~15 GB Rust heap for a
+            #   14.96 GB object) but at the cost of pipeline stalls.
+            #
+            # Tuning levers:
+            #   S3DLIO_MULTIPART_PART_SIZE_MB  — part size in MiB (default: 16)
+            #       Larger parts → fewer semaphore trips but each stall lasts longer.
+            #       Smaller parts + more max_in_flight → more concurrent MinIO connections.
+            #   S3DLIO_MULTIPART_MAX_IN_FLIGHT — concurrent upload slots (default: 16)
+            #       More slots → more parallel MinIO UploadPart connections per object.
+            #       Peak Rust memory = max_in_flight × part_size_bytes.
+            #
+            # Benchmark matrix (env-var driven — no code change needed):
+            #   16 MB × 16 slots  →  256 MB peak, 16 connections  (library default)
+            #   16 MB × 32 slots  →  512 MB peak, 32 connections
+            #   16 MB × 64 slots  →    1 GB peak, 64 connections
+            #   32 MB × 32 slots  →    1 GB peak, 32 connections
+            #   64 MB × 16 slots  →    1 GB peak, 16 connections
+            #  128 MB ×  8 slots  →    1 GB peak,  8 connections  (previous default)
+            #
+            # Root-cause fix (tracked in GitHub issue #134):
+            #   A coordinator Tokio task + bounded mpsc::channel will make the Python
+            #   writer non-blocking regardless of max_in_flight, eliminating stalls.
+            #   Until that fix lands, maximising max_in_flight within memory budget
+            #   is the best available workaround.
+            #
+            _part_size_mb   = int(os.environ.get("S3DLIO_MULTIPART_PART_SIZE_MB",  "128"))
+            _max_in_flight  = int(os.environ.get("S3DLIO_MULTIPART_MAX_IN_FLIGHT", "8"))
             streaming_kwargs.update(
-                max_in_flight=max(2, 16 // _mpi_world_size),
+                part_size=_part_size_mb * 1024 * 1024,
+                max_in_flight=_max_in_flight,
             )
 
         self._streaming = _SC(**streaming_kwargs)

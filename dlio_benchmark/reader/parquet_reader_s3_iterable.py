@@ -231,7 +231,15 @@ class ParquetReaderS3Iterable(FormatReader):
 
         args = self._args
         opts = getattr(args, "storage_options", {}) or {}
-        self._storage_library = opts.get("storage_library", "s3dlio")
+        # storage_library is REQUIRED — there is no default.  Every object
+        # storage workload must explicitly declare which library to use.
+        self._storage_library = opts.get("storage_library")
+        if self._storage_library is None:
+            raise ValueError(
+                "storage_options['storage_library'] is required for S3 readers. "
+                "Add 'storage_library: <value>' under the 'storage:' section of "
+                "your workload YAML.  Supported values: minio, s3dlio, s3torchconnector."
+            )
         self._opts = opts
         self._epoch = epoch
 

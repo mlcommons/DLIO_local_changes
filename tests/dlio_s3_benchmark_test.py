@@ -269,15 +269,7 @@ def setup_test_env():
 def patch_s3_checkpoint(setup_test_env):
     storage_root, storage_type, mock_client, s3_overrides = setup_test_env
     s3_overrides += [f"++workload.checkpoint.checkpoint_folder=s3://{storage_root}/checkpoints"]
-
-    def mock_init(self, region=None, endpoint=None, s3client_config=None):
-        self.region = region
-        self.endpoint = endpoint
-        self.s3client_config = s3client_config
-        self._client = mock_client
-
-    with patch("dlio_benchmark.checkpointing.pytorch_s3_checkpointing.S3Checkpoint.__init__", new=mock_init):
-        yield setup_test_env  # yield the full tuple so tests can still use all values
+    yield setup_test_env
 
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
 @pytest.mark.parametrize("fmt, framework", [("npy", "pytorch"), ("npz", "pytorch")])

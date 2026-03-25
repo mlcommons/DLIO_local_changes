@@ -26,8 +26,8 @@ class CheckpointMechanismType(Enum):
     CUSTOM = 'custom'
     TF_SAVE = 'tf_save'
     PT_SAVE = 'pt_save'
-    PT_S3_SAVE = 'pt_s3_save'   # s3torchconnector native S3Checkpoint API
-    PT_OBJ_SAVE = 'pt_obj_save' # Generic object-store (minio or s3dlio)
+    PT_S3_SAVE = 'pt_s3_save'   # Alias for pt_obj_save; retained for config backward compatibility
+    PT_OBJ_SAVE = 'pt_obj_save' # Object-store checkpoint (minio, s3dlio, or s3torchconnector)
 
     def __str__(self):
         return self.value

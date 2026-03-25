@@ -363,9 +363,16 @@ class ConfigArguments:
         # storage_type=s3 means "object storage"; storage_library selects which
         # SDK to use (minio, s3dlio, or s3torchconnector).  Do NOT conflate them.
         if self.storage_type == StorageType.S3 and self.framework == FrameworkType.PYTORCH:
-            # Determine which storage library is selected (default: s3torchconnector
-            # for backwards compatibility with existing configs that omit storage_library).
-            storage_library = (self.storage_options or {}).get("storage_library", "s3torchconnector")
+            # storage_library is REQUIRED — there is no default.  Every object
+            # storage workload must explicitly declare which library to use.
+            storage_library = (self.storage_options or {}).get("storage_library")
+            if storage_library is None:
+                raise Exception(
+                    "storage_options.storage_library is required when storage_type=s3. "
+                    "Add 'storage_library: <value>' under the 'storage:' section of your "
+                    "workload YAML (or pass storage.storage_options.storage_library=<value> "
+                    "via --param).  Supported values: minio, s3dlio, s3torchconnector."
+                )
 
             if storage_library == "s3torchconnector":
                 # s3torchconnector only supports NPZ and NPY data formats for training.
@@ -521,7 +528,15 @@ class ConfigArguments:
                     # storage_type=s3 with PyTorch: choose mechanism based on storage_library.
                     # s3torchconnector uses its native S3Checkpoint API (PT_S3_SAVE).
                     # minio and s3dlio use the generic ObjStoreLib checkpoint (PT_OBJ_SAVE).
-                    storage_library = (self.storage_options or {}).get("storage_library", "s3torchconnector")
+                    # storage_library is REQUIRED — there is no default.
+                    storage_library = (self.storage_options or {}).get("storage_library")
+                    if storage_library is None:
+                        raise Exception(
+                            "storage_options.storage_library is required when storage_type=s3. "
+                            "Add 'storage_library: <value>' under the 'storage:' section of your "
+                            "workload YAML (or pass storage.storage_options.storage_library=<value> "
+                            "via --param).  Supported values: minio, s3dlio, s3torchconnector."
+                        )
                     if storage_library == "s3torchconnector":
                         self.checkpoint_mechanism = CheckpointMechanismType.PT_S3_SAVE
                     else:
