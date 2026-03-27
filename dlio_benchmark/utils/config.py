@@ -507,13 +507,13 @@ class ConfigArguments:
                 self.logger.output(f"  Remove DLIO_DATA_GEN=numpy to restore dgen-py (default).")
                 self.logger.output(f"{'='*80}")
             elif not HAS_DGEN:
-                # dgen is the default but dgen-py is not installed — fail immediately
-                # rather than silently degrading to numpy in every MPI rank.
-                raise RuntimeError(
-                    "dgen-py is required but not installed.\n"
-                    "Install with: pip install dgen-py\n"
-                    "To use the slow NumPy fallback explicitly: DLIO_DATA_GEN=numpy"
+                # dgen is the default but dgen-py is not installed — warn and fall back.
+                self.logger.warning(
+                    "dgen-py is not installed — falling back to NumPy for data generation "
+                    "(~155x slower). Install dgen-py>=0.2.0 (requires Python>=3.11) for "
+                    "full performance, or set DLIO_DATA_GEN=numpy to suppress this warning."
                 )
+                self.data_gen_method = 'numpy'
             else:
                 self.logger.output(f"{'='*80}")
                 self.logger.output(f"Data Generation Method: DGEN (default)")
