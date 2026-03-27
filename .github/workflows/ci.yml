@@ -84,7 +84,7 @@ jobs:
           DFTRACER_TRACE_COMPRESSION: 0
         run: |
           source ${VENV_PATH}/bin/activate
-          pytest tests/dlio_ai_logging_test.py -n 4 -v
+          pytest tests/dlio_ai_logging_test.py -n 1 -v
           rm -rf outputs
       - name: test_dataset_dimension_gen_data
         run: |
