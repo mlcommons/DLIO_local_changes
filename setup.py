@@ -13,7 +13,7 @@ test_deps = [
 core_deps = [
     "Pillow>=9.3.0",
     "PyYAML>=6.0.0",
-    "dgen-py>=0.2.0",
+    "dgen-py>=0.2.0; python_version >= '3.10'",
     "h5py>=3.11.0",
     "mpi4py>=3.1.4",
     "numpy>=1.23.5",

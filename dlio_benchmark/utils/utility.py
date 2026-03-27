@@ -338,7 +338,8 @@ def gen_random_tensor(shape, dtype, rng=None, method=None, writeable=True, seed=
     This is 155x faster than NumPy and uses no extra memory during generation.
 
     The only supported methods are:
-    - 'dgen'  : dgen-py (default). Fails hard if dgen-py is not installed.
+    - 'dgen'  : dgen-py (default, Python>=3.10). Falls back to numpy with a
+                warning if dgen-py is not installed.
     - 'numpy' : NumPy random generation. Slow legacy path — only use for explicit
                 comparison benchmarks. Set DLIO_DATA_GEN=numpy to activate.
 
@@ -378,14 +379,14 @@ def gen_random_tensor(shape, dtype, rng=None, method=None, writeable=True, seed=
         # Explicit numpy request — allowed for comparison benchmarks only.
         use_dgen = False
     elif use_dgen and not HAS_DGEN:
-        # Hard failure: dgen was requested (the default) but dgen-py is not installed.
-        # We do NOT fall back to numpy — that would silently degrade performance by
-        # 155x with no visible warning in production MPI runs.
-        raise RuntimeError(
-            "dgen-py is required but not installed.\n"
-            "Install with: pip install dgen-py\n"
-            "To use the slow NumPy fallback explicitly: DLIO_DATA_GEN=numpy"
+        # dgen-py not installed (e.g. Python 3.9 where dgen-py is unavailable).
+        # Warn once and fall back to numpy so the benchmark still runs.
+        logging.getLogger("DLIO").warning(
+            "dgen-py is not installed — falling back to NumPy for data generation "
+            "(~155x slower). Install dgen-py>=0.2.0 (requires Python>=3.10) for "
+            "full performance, or set DLIO_DATA_GEN=numpy to suppress this warning."
         )
+        use_dgen = False
     
     # Fast path: Use dgen-py with ZERO-COPY BytesView (155x faster than NumPy)
     if use_dgen:
