@@ -22,77 +22,118 @@ import pyarrow.parquet as pq
 
 from dlio_benchmark.common.enumerations import Compression
 from dlio_benchmark.data_generator.data_generator import DataGenerator
-from dlio_benchmark.utils.utility import progress
+from dlio_benchmark.utils.utility import progress, gen_random_tensor
 
-# Map DLIO Compression enum values to PyArrow compression strings
+# Map DLIO Compression enum values to PyArrow compression strings.
 COMPRESSION_MAP = {
     Compression.NONE: None,
-    Compression.SNAPPY: 'snappy',
     Compression.GZIP: 'gzip',
-    Compression.LZ4: 'lz4',
-    Compression.ZSTD: 'zstd',
+}
+
+# All numeric dtypes supported for column generation.
+# Integer types use the full value range for maximum entropy.
+_NP_TYPE_MAP = {
+    'uint8':   np.uint8,
+    'uint16':  np.uint16,
+    'uint32':  np.uint32,
+    'uint64':  np.uint64,
+    'int8':    np.int8,
+    'int16':   np.int16,
+    'int32':   np.int32,
+    'int64':   np.int64,
+    'float16': np.float16,
+    'float32': np.float32,
+    'float64': np.float64,
+}
+
+_PA_SCALAR_TYPE_MAP = {
+    'uint8':   pa.uint8(),
+    'uint16':  pa.uint16(),
+    'uint32':  pa.uint32(),
+    'uint64':  pa.uint64(),
+    'int8':    pa.int8(),
+    'int16':   pa.int16(),
+    'int32':   pa.int32(),
+    'int64':   pa.int64(),
+    'float16': pa.float16(),
+    'float32': pa.float32(),
+    'float64': pa.float64(),
 }
 
 
 class ParquetGenerator(DataGenerator):
     """
-    Schema-driven Parquet data generator with full compression and partitioning support.
+    Schema-driven Parquet data generator.
 
-    When parquet_columns is configured, generates multi-column files with specified
-    dtypes (float32, float64, string, binary, bool). When empty, falls back to
-    Phase 9 single 'data' column behavior for backward compatibility.
+    Supports two modes:
 
-    Supports configurable row_group_size, batched writing for memory efficiency,
-    and optional Hive-style partitioning.
-    
-    Memory Optimization Features:
-    - Batched writing: Data is generated and written in batches to reduce peak memory usage
-    - Vectorized Numpy-to-Arrow conversion: Uses FixedSizeListArray.from_arrays for zero-copy
-      or near zero-copy conversion instead of inefficient list comprehensions
-    - Configurable batch size via parquet_generation_batch_size parameter
+    1. **Column-schema mode** (``parquet_columns`` config list is non-empty):
+       Generates multi-column files from a list of column specs, each with a
+       ``name``, ``dtype``, and optional ``size`` (embedding vector length).
+       Supported dtypes: uint8/16/32/64, int8/16/32/64, float16/32/64,
+       string, binary, bool.
+
+    2. **Legacy mode** (``parquet_columns`` empty):
+       Single ``data`` column of fixed-size uint8 lists, matching the original
+       DLIO behaviour for backward compatibility.
+
+    Key design properties:
+    - **Unique samples**: every row in every batch has distinct data — the
+      tile-copy bug from the original generator is eliminated.
+    - **RNG flow-through**: a single ``np.random.Generator`` is initialised
+      once per rank and advanced naturally through all file and batch
+      generations.  No seed resets occur between files.
+    - **Near-zero copy**: numeric columns use ``gen_random_tensor`` with
+      ``rng=rng``; once the raw bytes exist they are wrapped in a
+      ``FixedSizeListArray`` via ``pa.array()`` using contiguous buffers —
+      no Python-level list comprehensions for fixed-size data.
+    - **Configurable batching**: large files are written in batches of
+      ``parquet_generation_batch_size`` rows to bound peak memory.
     """
 
     def __init__(self):
         super().__init__()
-        self.parquet_columns = self._args.parquet_columns
-        self.row_group_size = self._args.parquet_row_group_size
-        self.partition_by = self._args.parquet_partition_by
-        # Use generation_batch_size if set, otherwise default to row_group_size
-        self.generation_batch_size = self._args.parquet_generation_batch_size
-        if self.generation_batch_size <= 0:
-            self.generation_batch_size = self.row_group_size
+        self.parquet_columns = getattr(self._args, 'parquet_columns', [])
+        self.row_group_size = getattr(self._args, 'parquet_row_group_size', 1024)
+        self.partition_by = getattr(self._args, 'parquet_partition_by', None)
+        batch = getattr(self._args, 'parquet_generation_batch_size', 0)
+        self.generation_batch_size = batch if batch > 0 else self.row_group_size
 
-    def _build_schema(self):
-        """Build PyArrow schema from column specifications for use with ParquetWriter."""
+    # ── Schema ───────────────────────────────────────────────────────────────
+
+    def _build_schema(self, legacy_elem_size=None):
+        """Build PyArrow schema from configured columns.
+
+        When called in legacy mode (``parquet_columns`` is empty or None),
+        ``legacy_elem_size`` must be provided; it is the number of uint8
+        elements per sample (= dim1 * dim2).  The schema uses a
+        ``pa.list_(pa.uint8(), legacy_elem_size)`` fixed-size list, which
+        lets PyArrow use the efficient ``FixedSizeListArray`` representation
+        on reads.
+
+        When called in column-schema mode, ``legacy_elem_size`` is ignored.
+        """
         if not self.parquet_columns:
-            # Backward compatible: single 'data' column with list of uint8
-            return pa.schema([('data', pa.list_(pa.uint8()))])
-        
-        # Scalar PyArrow type map for numeric dtypes
-        SCALAR_PA_TYPES = {
-            'int8': pa.int8(),
-            'float16': pa.float16(),
-            'float32': pa.float32(),
-            'float64': pa.float64(),
-        }
+            size = legacy_elem_size or 1
+            return pa.schema([('data', pa.list_(pa.uint8(), size))])
 
         fields = []
         for col_spec in self.parquet_columns:
             if hasattr(col_spec, 'get'):
-                name = str(col_spec.get('name', 'data'))
+                name  = str(col_spec.get('name', 'data'))
                 dtype = str(col_spec.get('dtype', 'float32'))
-                size = int(col_spec.get('size', 1))
+                size  = int(col_spec.get('size', 1))
             else:
-                name = str(col_spec)
-                dtype = 'float32'
-                size = 1
+                name, dtype, size = str(col_spec), 'float32', 1
 
-            if size == 1 and dtype in SCALAR_PA_TYPES:
-                # Scalar path: single-element numeric columns — most efficient for reads
-                fields.append(pa.field(name, SCALAR_PA_TYPES[dtype]))
-            elif dtype in SCALAR_PA_TYPES:
-                # List path: multi-element numeric columns
-                fields.append(pa.field(name, pa.list_(SCALAR_PA_TYPES[dtype], size)))
+            pa_scalar = _PA_SCALAR_TYPE_MAP.get(dtype)
+
+            if pa_scalar is not None:
+                if size == 1:
+                    fields.append(pa.field(name, pa_scalar))
+                else:
+                    # Fixed-size list of the scalar type
+                    fields.append(pa.field(name, pa.list_(pa_scalar, size)))
             elif dtype == 'list':
                 fields.append(pa.field(name, pa.list_(pa.float32(), size)))
             elif dtype == 'string':
@@ -102,165 +143,144 @@ class ParquetGenerator(DataGenerator):
             elif dtype == 'bool':
                 fields.append(pa.field(name, pa.bool_()))
             else:
-                # Fallback: treat unknown dtype as float32 list
+                # Unknown dtype — fall back to fixed-size float32 list
                 fields.append(pa.field(name, pa.list_(pa.float32(), size)))
 
         return pa.schema(fields)
 
-    def _generate_column_data_batch(self, col_spec, batch_size):
+    # ── Batch generation helpers ──────────────────────────────────────────────
+
+    def _generate_column_data_batch(self, col_spec, batch_size, rng):
+        """Generate one batch of data for a single column.
+
+        All numeric dtypes use ``gen_random_tensor(rng=rng)`` so the RNG
+        state advances naturally — no seed is computed or reset between calls.
+
+        Returns ``(name, pa.Array)``.
         """
-        Generate data for a single column based on its dtype specification.
-        
-        Uses optimized vectorized conversion for Numpy-to-Arrow to minimize
-        memory overhead and avoid intermediate Python objects.
-        """
-        # Handle both dict and Hydra DictConfig by accessing values and casting to native types
-        if hasattr(col_spec, 'get'):  # dict-like (dict or DictConfig)
-            name = str(col_spec.get('name', 'data'))
+        if hasattr(col_spec, 'get'):
+            name  = str(col_spec.get('name', 'data'))
             dtype = str(col_spec.get('dtype', 'float32'))
-            size = int(col_spec.get('size', 1))
+            size  = int(col_spec.get('size', 1))
         else:
-            name = str(col_spec)
-            dtype = 'float32'
-            size = 1
+            name, dtype, size = str(col_spec), 'float32', 1
 
-        # Scalar path: size=1 numeric columns — avoid FixedSizeListArray overhead
-        if size == 1 and dtype == 'int8':
-            data = np.random.randint(-128, 128, batch_size, dtype=np.int8)
-            return name, pa.array(data, type=pa.int8())
+        np_type = _NP_TYPE_MAP.get(dtype)
+        pa_scalar = _PA_SCALAR_TYPE_MAP.get(dtype)
 
-        if size == 1 and dtype == 'float16':
-            data = np.random.rand(batch_size).astype(np.float16)
-            return name, pa.array(data, type=pa.float16())
+        # ── Numeric scalar (size == 1) ──────────────────────────────────────
+        if np_type is not None and pa_scalar is not None and size == 1:
+            data = gen_random_tensor(shape=(batch_size,), dtype=np_type, rng=rng)
+            return name, pa.array(data, type=pa_scalar)
 
-        if size == 1 and dtype in ('float32', 'float64'):
-            np_dtype = np.float32 if dtype == 'float32' else np.float64
-            pa_type = pa.float32() if dtype == 'float32' else pa.float64()
-            data = np.random.rand(batch_size).astype(np_dtype)
-            return name, pa.array(data, type=pa_type)
-
-        # List path: multi-element columns use FixedSizeListArray
-        if dtype == 'int8':
-            data = np.random.randint(-128, 128, (batch_size, size), dtype=np.int8)
-            flat_data = data.ravel()
-            arrow_flat = pa.array(flat_data, type=pa.int8())
-            arrow_data = pa.FixedSizeListArray.from_arrays(arrow_flat, size)
-            return name, arrow_data
-
-        if dtype == 'float16':
-            data = np.random.rand(batch_size, size).astype(np.float16)
-            flat_data = data.ravel()
-            arrow_flat = pa.array(flat_data, type=pa.float16())
-            arrow_data = pa.FixedSizeListArray.from_arrays(arrow_flat, size)
-            return name, arrow_data
-
-        if dtype in ('float32', 'float64'):
-            np_dtype = np.float32 if dtype == 'float32' else np.float64
-            # Generate data as contiguous array
-            data = np.random.rand(batch_size, size).astype(np_dtype)
-            # Optimized conversion: use FixedSizeListArray.from_arrays for zero-copy
-            flat_data = data.ravel()
-            arrow_flat = pa.array(flat_data)
-            arrow_data = pa.FixedSizeListArray.from_arrays(arrow_flat, size)
-            return name, arrow_data
+        # ── Numeric fixed-size list (size > 1) ─────────────────────────────
+        if np_type is not None and pa_scalar is not None:
+            # Generate as a flat (batch_size * size) array, then wrap as
+            # FixedSizeListArray — zero extra copies after dgen/numpy.
+            data = gen_random_tensor(shape=(batch_size * size,), dtype=np_type, rng=rng)
+            arrow_flat = pa.array(data, type=pa_scalar)
+            return name, pa.FixedSizeListArray.from_arrays(arrow_flat, size)
 
         if dtype == 'list':
-            # Treat like float32 with configurable size
-            data = np.random.rand(batch_size, size).astype(np.float32)
-            # Optimized conversion
-            flat_data = data.ravel()
-            arrow_flat = pa.array(flat_data)
-            arrow_data = pa.FixedSizeListArray.from_arrays(arrow_flat, size)
-            return name, arrow_data
+            data = gen_random_tensor(shape=(batch_size * size,), dtype=np.float32, rng=rng)
+            arrow_flat = pa.array(data, type=pa.float32())
+            return name, pa.FixedSizeListArray.from_arrays(arrow_flat, size)
 
+        # ── Non-numeric types — use numpy global state (seeded per rank) ───
         if dtype == 'string':
-            data = [f"text_{j}" for j in range(batch_size)]
-            return name, pa.array(data, type=pa.string())
+            # Use integers from rng to build strings so they vary per run seed
+            ints = rng.integers(0, 2**31, size=batch_size)
+            return name, pa.array([f"s_{v}" for v in ints], type=pa.string())
 
         if dtype == 'binary':
-            data = [np.random.bytes(size) for _ in range(batch_size)]
-            return name, pa.array(data, type=pa.binary())
+            # Each sample: size random bytes from rng
+            rows = [rng.bytes(size) for _ in range(batch_size)]
+            return name, pa.array(rows, type=pa.binary())
 
         if dtype == 'bool':
-            data = np.random.choice([True, False], batch_size)
-            return name, pa.array(data, type=pa.bool_())
+            bits = rng.integers(0, 2, size=batch_size, dtype=np.uint8)
+            return name, pa.array(bits.astype(bool), type=pa.bool_())
 
-        # Fallback: treat unknown dtype as float32
-        data = np.random.rand(batch_size, size).astype(np.float32)
-        flat_data = data.ravel()
-        arrow_flat = pa.array(flat_data)
-        arrow_data = pa.FixedSizeListArray.from_arrays(arrow_flat, size)
-        return name, arrow_data
+        # Fallback: float32 fixed-size list
+        data = gen_random_tensor(shape=(batch_size * size,), dtype=np.float32, rng=rng)
+        arrow_flat = pa.array(data, type=pa.float32())
+        return name, pa.FixedSizeListArray.from_arrays(arrow_flat, size)
 
-    def _generate_batch_columns(self, batch_size):
-        """Generate all columns for a batch of samples."""
+    def _generate_batch_columns(self, batch_size, rng):
+        """Generate all configured columns for one batch.
+
+        The same ``rng`` object is advanced per column so every column in
+        every batch gets statistically independent, non-repeating data.
+        """
         columns = {}
         for col_spec in self.parquet_columns:
-            name, arrow_data = self._generate_column_data_batch(col_spec, batch_size)
+            name, arrow_data = self._generate_column_data_batch(col_spec, batch_size, rng)
             columns[name] = arrow_data
         return columns
 
-    def _generate_legacy_batch(self, dim1, dim2, batch_size):
+    def _generate_legacy_batch(self, elem_size, batch_size, rng):
+        """Generate one batch for the legacy single-'data'-column mode.
+
+        Generates ``(batch_size * elem_size)`` bytes in one dgen/numpy call,
+        then wraps the result as a ``FixedSizeListArray`` — no per-row Python
+        loop, no tiling, no copy.  Each row is a distinct slice of the data
+        stream so samples within the same file are NOT identical.
+
+        ``elem_size`` = dim1 * dim2 (the flat element count per sample).
         """
-        Generate backward-compatible single 'data' column batch.
-        
-        Uses optimized conversion for the legacy format.
-        """
-        record = np.random.randint(255, size=dim1 * dim2, dtype=np.uint8)
-        # Create batch_size copies of the record using numpy broadcasting
-        records = np.tile(record, (batch_size, 1))
-        # Optimized conversion using FixedSizeListArray
-        flat_data = records.ravel()
-        arrow_flat = pa.array(flat_data)
-        arrow_data = pa.FixedSizeListArray.from_arrays(arrow_flat, dim1 * dim2)
+        # One contiguous buffer for all rows — zero-copy FixedSizeList wrap.
+        flat = gen_random_tensor(shape=(batch_size * elem_size,), dtype=np.uint8, rng=rng)
+        arrow_flat = pa.array(flat, type=pa.uint8())
+        arrow_data = pa.FixedSizeListArray.from_arrays(arrow_flat, elem_size)
         return {'data': arrow_data}
 
-    def _generate_column_data(self, col_spec, num_samples):
-        """
-        Generate data for a single column based on its dtype specification.
-        
-        This method is kept for backward compatibility but uses the optimized
-        batch generation internally.
-        """
-        return self._generate_column_data_batch(col_spec, num_samples)
+    # ── Main generation loop ──────────────────────────────────────────────────
 
     def generate(self):
-        """
-        Generate parquet data files with config-driven schema or backward-compatible single column.
-        
-        Uses batched writing strategy to minimize memory usage:
-        - Opens ParquetWriter with pre-defined schema
-        - Generates data in batches of size `generation_batch_size`
-        - Writes each batch immediately to disk
-        - Closes writer when complete
-        
-        This approach significantly reduces peak memory usage for large files.
+        """Generate Parquet files using batched, RNG-flow-through generation.
+
+        Seeding:
+        - One ``np.random.Generator`` is created per MPI rank, seeded with
+          ``BASE_SEED + my_rank``, and advanced through ALL file and batch
+          generations without any intermediate resets.
+        - This guarantees: (a) cross-file uniqueness — each file starts from a
+          different RNG state; (b) within-file uniqueness — each batch and each
+          sample row continues from where the previous one left off; (c)
+          reproducibility — the same master seed always produces the same files.
         """
         super().generate()
-        np.random.seed(10)
+
+        # Single RNG for the entire rank — never reset between files.
+        np.random.seed(self.BASE_SEED + self.my_rank)  # for global numpy state
+        rng = np.random.default_rng(seed=self.BASE_SEED + self.my_rank)
+
         record_label = 0
         dim = self.get_dimension(self.total_files_to_generate)
-
-        # Resolve compression from enum
         compression = COMPRESSION_MAP.get(self.compression, None)
+        is_local = self.storage.islocalfs()
 
         for i in range(self.my_rank, int(self.total_files_to_generate), self.comm_size):
             progress(i + 1, self.total_files_to_generate, "Generating Parquet Data")
 
             out_path_spec = self.storage.get_uri(self._file_list[i])
 
+            # Compute element size for legacy mode (dim may be list or scalar).
+            dim_raw = dim[2 * i]
+            if isinstance(dim_raw, list):
+                dim1 = int(dim_raw[0])
+                dim2 = int(dim_raw[1]) if len(dim_raw) > 1 else 1
+            else:
+                dim1 = int(dim_raw)
+                dim2 = int(dim[2 * i + 1])
+            elem_size = dim1 * dim2
+
             if self.partition_by:
-                # Partitioned writes don't support streaming, use table-based approach
-                # but still use optimized column generation
+                # Partitioned writes don't support streaming — use full-table approach.
                 if self.parquet_columns:
-                    columns = self._generate_batch_columns(self.num_samples)
-                    table = pa.table(columns)
+                    columns = self._generate_batch_columns(self.num_samples, rng)
                 else:
-                    dim1 = dim[2 * i]
-                    dim2 = dim[2 * i + 1]
-                    columns = self._generate_legacy_batch(dim1, dim2, self.num_samples)
-                    table = pa.table(columns)
-                
+                    columns = self._generate_legacy_batch(elem_size, self.num_samples, rng)
+                table = pa.table(columns)
                 pq.write_to_dataset(
                     table,
                     root_path=os.path.dirname(out_path_spec),
@@ -268,39 +288,40 @@ class ParquetGenerator(DataGenerator):
                     compression=compression,
                     row_group_size=self.row_group_size,
                 )
-            else:
-                # Use batched writing for memory efficiency
-                schema = self._build_schema()
-                
-                # Ensure parent directory exists
+                continue
+
+            # Build schema.  For legacy mode include elem_size so PyArrow uses
+            # FixedSizeListArray on read (better performance, correct schema).
+            schema = self._build_schema(legacy_elem_size=elem_size)
+
+            if is_local:
                 parent_dir = os.path.dirname(out_path_spec)
                 if parent_dir:
                     os.makedirs(parent_dir, exist_ok=True)
-                
-                with pq.ParquetWriter(out_path_spec, schema, compression=compression) as writer:
-                    num_batches = (self.num_samples + self.generation_batch_size - 1) // self.generation_batch_size
-                    
-                    for batch_idx in range(num_batches):
-                        batch_start = batch_idx * self.generation_batch_size
-                        batch_end = min(batch_start + self.generation_batch_size, self.num_samples)
-                        current_batch_size = batch_end - batch_start
-                        
-                        if self.parquet_columns:
-                            columns = self._generate_batch_columns(current_batch_size)
-                        else:
-                            dim1 = dim[2 * i]
-                            dim2 = dim[2 * i + 1]
-                            columns = self._generate_legacy_batch(dim1, dim2, current_batch_size)
-                        
-                        batch_table = pa.table(columns)
-                        writer.write_table(batch_table, row_group_size=self.row_group_size)
-                        
-                        # Log batch progress for large files
-                        if num_batches > 1 and self.my_rank == 0:
-                            self.logger.debug(
-                                f"File {i+1}/{self.total_files_to_generate}: "
-                                f"Wrote batch {batch_idx+1}/{num_batches} "
-                                f"({current_batch_size} samples)"
-                            )
+                writer_target = out_path_spec
+            else:
+                writer_target = pa.BufferOutputStream()
+
+            with pq.ParquetWriter(writer_target, schema, compression=compression) as writer:
+                num_batches = (
+                    self.num_samples + self.generation_batch_size - 1
+                ) // self.generation_batch_size
+
+                for batch_idx in range(num_batches):
+                    batch_start = batch_idx * self.generation_batch_size
+                    batch_end = min(batch_start + self.generation_batch_size, self.num_samples)
+                    current_batch_size = batch_end - batch_start
+
+                    # rng advances per batch — each batch gets unique data.
+                    if self.parquet_columns:
+                        columns = self._generate_batch_columns(current_batch_size, rng)
+                    else:
+                        columns = self._generate_legacy_batch(elem_size, current_batch_size, rng)
+
+                    batch_table = pa.table(columns)
+                    writer.write_table(batch_table, row_group_size=self.row_group_size)
+
+            if not is_local:
+                self.storage.put_data(out_path_spec, writer_target.getvalue().to_pybytes())
 
         np.random.seed()

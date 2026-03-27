@@ -27,18 +27,27 @@ class SyntheticGenerator(DataGenerator):
     def __init__(self):
         super().__init__()
 
-    @dlp.log        
+    @dlp.log
     def generate(self):
         """
         Generator for creating dummy files.
+
+        Each file contains its global file index i as a UTF-8 string.
+        Uses the _generate_files template so that:
+        - Rank-unique seeds are set before the loop.
+        - Object storage is handled transparently (BytesIO path).
+        - Local filesystem writes go directly to the resolved path.
         """
         super().generate()
-        np.random.seed(10)
-        for i in dlp.iter(range(self.my_rank, int(self.total_files_to_generate), self.comm_size)):
-            out_path_spec = self.storage.get_uri(self._file_list[i])
+
+        def _write(i, dim_, dim1, dim2, file_seed, rng, out_path_spec, is_local, output):
             if self.my_rank == 0 and i % 100 == 0:
                 self.logger.info(f"Generated file {i}/{self.total_files_to_generate}")
-            progress(i+1, self.total_files_to_generate, "Generating Synethic Data (Empty)")
-            with open(out_path_spec, 'w') as f:
-                f.write(f"{i}")
-        np.random.seed()
+            content = f"{i}".encode("utf-8")
+            if is_local:
+                with open(out_path_spec, "wb") as f:
+                    f.write(content)
+            else:
+                output.write(content)
+
+        self._generate_files(_write, "Synthetic Data (Empty)")

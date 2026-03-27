@@ -34,31 +34,23 @@ class JPEGGenerator(DataGenerator):
     def generate(self):
         """
         Generator for creating data in JPEG format of 3d dataset.
+        Uses the base-class template for seeding, BytesIO, and put_data.
         """
         super().generate()
-        np.random.seed(10)
-        rng = np.random.default_rng()
-        dim = self.get_dimension(self.total_files_to_generate)
-        for i in dlp.iter(range(self.my_rank, int(self.total_files_to_generate), self.comm_size)):
-            dim_ = dim[2*i]
-            if isinstance(dim_, list):
-                dim1 = dim_[0]
-                dim2 = dim_[1]
-            else:
-                dim1 = dim_
-                dim2 = dim[2*i+1]
-            # Use gen_random_tensor (auto-uses dgen-py if available for 30-50x speedup)
-            records = gen_random_tensor(shape=(dim1, dim2), dtype=np.uint8, rng=rng)
-            records = np.clip(records, 0, 255).astype(np.uint8)  # Ensure valid JPEG range
-            if self.my_rank==0:
-                self.logger.debug(f"{utcnow()} Dimension of images: {dim1} x {dim2}")
+        my_rank = self.my_rank
+        total = self.total_files_to_generate
+        logger = self.logger
+
+        def _write(i, dim_, dim1, dim2, file_seed, rng,
+                   out_path_spec, is_local, output):
+            records = gen_random_tensor(shape=(dim1, dim2), dtype=np.uint8,
+                                        rng=rng)
+            records = np.clip(records, 0, 255).astype(np.uint8)
+            if my_rank == 0:
+                logger.debug(f"{utcnow()} Dimension of images: {dim1} x {dim2}")
             img = im.fromarray(records)
-            if self.my_rank == 0 and i % 100 == 0:
-                self.logger.info(f"Generated file {i}/{self.total_files_to_generate}")
-            out_path_spec = self.storage.get_uri(self._file_list[i])
-            progress(i+1, self.total_files_to_generate, "Generating JPEG Data")
-            output = out_path_spec if self.storage.islocalfs() else io.BytesIO()
+            if my_rank == 0 and i % 100 == 0:
+                logger.info(f"Generated file {i}/{total}")
             img.save(output, format='JPEG', bits=8)
-            if not self.storage.islocalfs():
-                self.storage.put_data(out_path_spec, output.getvalue())
-        np.random.seed()
+
+        self._generate_files(_write, "JPEG Data")

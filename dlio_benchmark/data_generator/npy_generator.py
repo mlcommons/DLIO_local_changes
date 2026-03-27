@@ -34,24 +34,19 @@ class NPYGenerator(DataGenerator):
     def generate(self):
         """
         Generator for creating data in NPY format of 3d dataset.
+        Uses the base-class template for seeding, BytesIO, and put_data.
         """
         super().generate()
-        np.random.seed(10)
-        rng = np.random.default_rng()
-        dim = self.get_dimension(self.total_files_to_generate)
-        for i in dlp.iter(range(self.my_rank, int(self.total_files_to_generate), self.comm_size)):
-            dim_ = dim[2*i]
-            if isinstance(dim_, list):
-                records = gen_random_tensor(shape=(*dim_, self.num_samples), dtype=self._args.record_element_dtype, rng=rng)
-            else:
-                dim1 = dim_
-                dim2 = dim[2*i+1]
-                records = gen_random_tensor(shape=(dim1, dim2, self.num_samples), dtype=self._args.record_element_dtype, rng=rng)
+        dtype = self._args.record_element_dtype
+        num_samples = self.num_samples
 
-            out_path_spec = self.storage.get_uri(self._file_list[i])
-            progress(i+1, self.total_files_to_generate, "Generating NPY Data")
-            output = out_path_spec if self.storage.islocalfs() else io.BytesIO()
+        def _write(i, dim_, dim1, dim2, file_seed, rng,
+                   out_path_spec, is_local, output):
+            if isinstance(dim_, list):
+                shape = (*dim_, num_samples)
+            else:
+                shape = (dim1, dim2, num_samples)
+            records = gen_random_tensor(shape=shape, dtype=dtype, rng=rng)
             np.save(output, records)
-            if not self.storage.islocalfs():
-                self.storage.put_data(out_path_spec, output.getvalue())
-        np.random.seed()
+
+        self._generate_files(_write, "NPY Data")
