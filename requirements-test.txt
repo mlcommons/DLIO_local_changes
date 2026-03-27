@@ -1,6 +1,7 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 --extra-index-url https://developer.download.nvidia.com/compute/redist
 
+dgen-py>=0.2.0; python_version >= '3.11'
 Pillow>=9.3.0
 PyYAML~=6.0.0
 hydra-core==1.3.2
