@@ -35,25 +35,29 @@ class NPZGenerator(DataGenerator):
     def generate(self):
         """
         Generator for creating data in NPZ format of 3d dataset.
+        Uses the base-class template for seeding, BytesIO, and put_data.
+        Bug fix: pass output.getvalue() (bytes) to put_data, not the BytesIO object.
         """
         super().generate()
-        np.random.seed(10)
-        rng = np.random.default_rng()
-        record_labels = [0] * self.num_samples
-        dim = self.get_dimension(self.total_files_to_generate)
-        for i in dlp.iter(range(self.my_rank, int(self.total_files_to_generate), self.comm_size)):
-            dim_ = dim[2*i]
+        dtype = self._args.record_element_dtype
+        num_samples = self.num_samples
+        record_labels = [0] * num_samples
+        compression = self.compression
+
+        def _write(i, dim_, dim1, dim2, file_seed, rng,
+                   out_path_spec, is_local, output):
             if isinstance(dim_, list):
-                records = gen_random_tensor(shape=(*dim_, self.num_samples), dtype=self._args.record_element_dtype, rng=rng, writeable=False)
+                records = gen_random_tensor(
+                    shape=(*dim_, num_samples), dtype=dtype,
+                    rng=rng, writeable=False)
             else:
-                records = gen_random_tensor(shape=(dim_, dim[2*i+1], self.num_samples), dtype=self._args.record_element_dtype, rng=rng, writeable=False)
-            out_path_spec = self.storage.get_uri(self._file_list[i])
-            progress(i+1, self.total_files_to_generate, "Generating NPZ Data")
-            output = out_path_spec if self.storage.islocalfs() else io.BytesIO()
-            if self.compression != Compression.ZIP:
+                records = gen_random_tensor(
+                    shape=(dim1, dim2, num_samples), dtype=dtype,
+                    rng=rng, writeable=False)
+            if compression != Compression.ZIP:
                 np.savez(output, x=records, y=record_labels)
             else:
                 np.savez_compressed(output, x=records, y=record_labels)
-            if not self.storage.islocalfs():
-                self.storage.put_data(out_path_spec, output)
-        np.random.seed()
+            # Note: template calls output.getvalue() for object storage — bug fixed.
+
+        self._generate_files(_write, "NPZ Data")

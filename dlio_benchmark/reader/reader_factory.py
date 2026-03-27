@@ -41,15 +41,29 @@ class ReaderFactory(object):
         elif type == FormatType.HDF5:
             if _args.odirect == True:
                 raise Exception("Odirect for %s format is not yet supported." %type)
+            elif _args.storage_type in (StorageType.S3, StorageType.AISTORE):
+                storage_library = (getattr(_args, "storage_options", {}) or {}).get("storage_library")
+                if storage_library in ("s3dlio", "s3torchconnector", "minio"):
+                    from dlio_benchmark.reader.hdf5_reader_s3_iterable import HDF5ReaderS3Iterable
+                    return HDF5ReaderS3Iterable(dataset_type, thread_index, epoch_number)
+                from dlio_benchmark.reader.hdf5_reader import HDF5Reader
+                return HDF5Reader(dataset_type, thread_index, epoch_number)
             else:
                 from dlio_benchmark.reader.hdf5_reader import HDF5Reader
                 return HDF5Reader(dataset_type, thread_index, epoch_number)
         elif type == FormatType.CSV:
             if _args.odirect == True:
                 raise Exception("Odirect for %s format is not yet supported." %type)
+            elif _args.storage_type in (StorageType.S3, StorageType.AISTORE):
+                storage_library = (getattr(_args, "storage_options", {}) or {}).get("storage_library")
+                if storage_library in ("s3dlio", "s3torchconnector", "minio"):
+                    from dlio_benchmark.reader.csv_reader_s3_iterable import CSVReaderS3Iterable
+                    return CSVReaderS3Iterable(dataset_type, thread_index, epoch_number)
+                from dlio_benchmark.reader.csv_reader import CSVReader
+                return CSVReader(dataset_type, thread_index, epoch_number)
             else:
                 from dlio_benchmark.reader.csv_reader import CSVReader
-            return CSVReader(dataset_type, thread_index, epoch_number)
+                return CSVReader(dataset_type, thread_index, epoch_number)
         elif type == FormatType.JPEG or type == FormatType.PNG:
             if _args.odirect == True:
                 raise Exception("Odirect for %s format is not yet supported." %type)
@@ -108,7 +122,12 @@ class ReaderFactory(object):
         elif type == FormatType.TFRECORD:
             if _args.odirect == True:
                 raise Exception("O_DIRECT for %s format is not yet supported." %type)
-            elif _args.data_loader == DataLoaderType.NATIVE_DALI: 
+            elif _args.storage_type in (StorageType.S3, StorageType.AISTORE):
+                storage_library = (getattr(_args, "storage_options", {}) or {}).get("storage_library")
+                if storage_library in ("s3dlio", "s3torchconnector", "minio"):
+                    from dlio_benchmark.reader.tfrecord_reader_s3_iterable import TFRecordReaderS3Iterable
+                    return TFRecordReaderS3Iterable(dataset_type, thread_index, epoch_number)
+            if _args.data_loader == DataLoaderType.NATIVE_DALI:
                 from dlio_benchmark.reader.dali_tfrecord_reader import DaliTFRecordReader
                 return DaliTFRecordReader(dataset_type, thread_index, epoch_number)
             else:

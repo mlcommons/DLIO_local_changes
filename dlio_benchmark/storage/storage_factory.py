@@ -44,7 +44,7 @@ class StorageFactory(object):
             return AIStoreStorage(namespace, framework)
         elif storage_type == StorageType.S3:
             from dlio_benchmark.common.enumerations import FrameworkType
-            if framework == FrameworkType.PYTORCH:
+            if framework in (FrameworkType.PYTORCH, FrameworkType.TENSORFLOW):
                 from dlio_benchmark.storage.obj_store_lib import ObjStoreLibStorage
                 return ObjStoreLibStorage(namespace, framework)
             return S3Storage(namespace, framework)

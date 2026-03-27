@@ -92,23 +92,42 @@ class TFFramework(Framework):
     def is_nativeio_available(self):
         return True
 
+    @staticmethod
+    def _is_object_store_uri(id):
+        return id.startswith(("s3://", "gs://", "az://", "azureml://"))
+
     @dlp.log
     def create_node(self, id, exist_ok=False):
+        # Object stores have no real directories — s3dlio.mkdir() is a no-op for S3.
+        # tf.io.gfile does not support s3:// without tensorflow-io installed.
+        if self._is_object_store_uri(id):
+            return True
         tf.io.gfile.makedirs(id)
         return True
 
     @dlp.log
     def get_node(self, id):
+        if self._is_object_store_uri(id):
+            import s3dlio
+            if s3dlio.exists(id):
+                return MetadataType.FILE  # S3 objects are always "files"
+            return None
         if tf.io.gfile.exists(id):
             if tf.io.gfile.isdir(id):
                 return MetadataType.DIRECTORY
             else:
                 return MetadataType.FILE
-        else:
-            return None
+        return None
 
     @dlp.log
     def walk_node(self, id, use_pattern=False):
+        if self._is_object_store_uri(id):
+            import s3dlio
+            # s3dlio.list() returns full URIs; extract relative keys to match
+            # the tf.io.gfile.listdir() contract (names only, not full paths).
+            uris = s3dlio.list(id)
+            prefix = id.rstrip("/") + "/"
+            return [u[len(prefix):] if u.startswith(prefix) else u for u in uris]
         try:
             if not use_pattern:
                 return tf.io.gfile.listdir(id)
@@ -119,20 +138,37 @@ class TFFramework(Framework):
 
     @dlp.log
     def delete_node(self, id):
+        if self._is_object_store_uri(id):
+            import s3dlio
+            # Delete all objects under this prefix
+            uris = s3dlio.list(id)
+            for uri in uris:
+                s3dlio.delete(uri)
+            return True
         tf.io.gfile.rmtree(id)
         return True
 
     @dlp.log
     def put_data(self, id, data, offset=None, length=None):
+        if self._is_object_store_uri(id):
+            import s3dlio
+            s3dlio.put_bytes(id, data)
+            return
         with tf.io.gfile.GFile(id, "w") as fd:
             fd.write(data)
 
     @dlp.log
     def get_data(self, id, data, offset=None, length=None):
+        if self._is_object_store_uri(id):
+            import s3dlio
+            return bytes(s3dlio.get(id))
         with tf.io.gfile.GFile(id, "r") as fd:
             data = fd.read()
         return data
 
     @dlp.log
     def isfile(self, id):
+        if self._is_object_store_uri(id):
+            import s3dlio
+            return s3dlio.exists(id)
         return tf.io.gfile.exists(id) and not tf.io.gfile.isdir(id)

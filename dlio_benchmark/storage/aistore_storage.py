@@ -32,10 +32,6 @@ except ImportError:
     Bucket = None
     Object = None
     AISError = Exception
-    logging.warning(
-        "AIStore SDK not available. Install with: pip install aistore\n"
-        "To use AIStore storage, set storage_type: aistore in your config."
-    )
 
 from dlio_benchmark.common.constants import MODULE_STORAGE
 from dlio_benchmark.storage.storage_handler import DataStorage, Namespace

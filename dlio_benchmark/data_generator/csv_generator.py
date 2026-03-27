@@ -15,6 +15,7 @@
    limitations under the License.
 """
 
+import io
 import numpy as np
 import pandas as pd
 
@@ -32,39 +33,47 @@ class CSVGenerator(DataGenerator):
     def generate(self):
         """
         Generate csv data for training. It generates a 2d dataset and writes it to file.
+        Supports both local filesystem and object storage targets via BytesIO serialization.
         """
         super().generate()
-        np.random.seed(10)
-        rng = np.random.default_rng()
-        dim = self.get_dimension(self.total_files_to_generate)
-        for i in range(self.my_rank, int(self.total_files_to_generate), self.comm_size):
-            progress(i+1, self.total_files_to_generate, "Generating CSV Data")
-            dim_ = dim[2*i]
-            total_size = np.prod(dim_)
+        dtype = self._args.record_element_dtype
+        num_samples = self.num_samples
+        compression_type = self.compression
+
+        def _write(i, dim_, dim1, dim2, file_seed, rng,
+                   out_path_spec, is_local, output):
             if isinstance(dim_, list):
                 shape = dim_
             else:
-                dim1 = dim[2*i]
-                dim2 = dim[2*i+1]
                 shape = (dim1, dim2)
-            total_size = np.prod(shape)
-
-            record = gen_random_tensor(shape=total_size, dtype=self._args.record_element_dtype, rng=rng)
-            records = [record] * self.num_samples
+            total_size = int(np.prod(shape))
+            # Generate unique data for ALL samples at once with a single call.
+            # Formerly this generated ONE record and tiled it num_samples times,
+            # which made every row in every CSV file identical — a correctness bug.
+            # Now each row (sample) gets a distinct slice of the dgen/RNG stream.
+            records = gen_random_tensor(shape=(num_samples, total_size), dtype=dtype, rng=rng)
             df = pd.DataFrame(data=records)
-            out_path_spec = self.storage.get_uri(self._file_list[i])
+
             compression = None
-            if self.compression != Compression.NONE:
-                compression = {
-                    "method": str(self.compression)
-                }
-                if self.compression == Compression.GZIP:
-                    out_path_spec = out_path_spec + ".gz"
-                elif self.compression == Compression.BZIP2:
-                    out_path_spec = out_path_spec + ".bz2"
-                elif self.compression == Compression.ZIP:
-                    out_path_spec = out_path_spec + ".zip"
-                elif self.compression == Compression.XZ:
-                    out_path_spec = out_path_spec + ".xz"
-            df.to_csv(out_path_spec, compression=compression, index=False, header=False)
-        np.random.seed()
+            local_path = out_path_spec
+            if compression_type != Compression.NONE:
+                compression = {"method": str(compression_type)}
+                if is_local:
+                    if compression_type == Compression.GZIP:
+                        local_path = out_path_spec + ".gz"
+                    elif compression_type == Compression.BZIP2:
+                        local_path = out_path_spec + ".bz2"
+                    elif compression_type == Compression.ZIP:
+                        local_path = out_path_spec + ".zip"
+                    elif compression_type == Compression.XZ:
+                        local_path = out_path_spec + ".xz"
+
+            if is_local:
+                df.to_csv(local_path, compression=compression,
+                          index=False, header=False)
+            else:
+                buf = io.StringIO()
+                df.to_csv(buf, compression=None, index=False, header=False)
+                output.write(buf.getvalue().encode('utf-8'))
+
+        self._generate_files(_write, "CSV Data")

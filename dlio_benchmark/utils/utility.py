@@ -331,7 +331,7 @@ def sleep(config):
         base_sleep(sleep_time)
     return sleep_time
 
-def gen_random_tensor(shape, dtype, rng=None, method=None, writeable=True):
+def gen_random_tensor(shape, dtype, rng=None, method=None, writeable=True, seed=None):
     """Generate random tensor data for DLIO benchmarks.
 
     DEFAULT: dgen-py (high-performance Rust-backed random data, zero-copy BytesView).
@@ -348,12 +348,19 @@ def gen_random_tensor(shape, dtype, rng=None, method=None, writeable=True):
     Args:
         shape:     Tuple specifying tensor dimensions.
         dtype:     NumPy dtype for the output array.
-        rng:       Optional NumPy Generator (only used for the numpy slow path).
+        rng:       Optional NumPy Generator (only used for the numpy slow path when
+                   seed is not provided).
         method:    Explicit method override ('dgen' or 'numpy'). If None, reads
                    DLIO_DATA_GEN from the environment (default: 'dgen').
         writeable: If False, skip the extra .copy() in the dgen path, saving one
                    full array allocation. Safe when the caller only reads the array
                    (e.g. np.savez). npz_generator passes writeable=False.
+        seed:      Optional integer seed for reproducible generation. When provided:
+                   - dgen path: passes seed to dgen_py.Generator(seed=seed)
+                   - numpy path: creates a new default_rng(seed=seed), ignoring rng
+                   When None (default): uses entropy (non-reproducible, unique each call).
+                   For MPI workloads, pass seed = BASE_SEED + file_index so each file
+                   gets unique-but-reproducible data across runs.
     """
     # ── Method selection ────────────────────────────────────────────────────────
     # Default is 'dgen'. The environment can override to 'numpy' for explicit
@@ -386,11 +393,19 @@ def gen_random_tensor(shape, dtype, rng=None, method=None, writeable=True):
         element_size = np.dtype(dtype).itemsize
         total_bytes = total_size * element_size
         
+        # When a flowing RNG is provided but no explicit seed, derive a
+        # well-spread seed from the RNG state. This advances the RNG by
+        # one call, giving true flow-through: each successive gen_random_tensor
+        # call gets a unique, reproducible, statistically independent seed
+        # without the adjacent-seed correlations of arithmetic (BASE_SEED + i).
+        if seed is None and rng is not None:
+            seed = int(rng.integers(0, 2**63))
+
         # Use dgen-py Generator to create zero-copy BytesView
         # This is 155x faster than NumPy and uses no extra memory
-        # Uses entropy (no seed) by default for unique random data each call
-        # This matches NumPy's default_rng() behavior (entropy-based)
-        gen = dgen_py.Generator(size=total_bytes)  # No seed = entropy
+        # seed=None → entropy (non-reproducible, unique each call)
+        # seed=<int> → reproducible, deterministic stream for given seed
+        gen = dgen_py.Generator(size=total_bytes, seed=seed)
         bytesview = gen.get_chunk(total_bytes)  # Returns BytesView (zero-copy, immutable)
         
         # Convert to NumPy array with correct dtype and reshape (ZERO-COPY)
@@ -405,8 +420,10 @@ def gen_random_tensor(shape, dtype, rng=None, method=None, writeable=True):
         return arr
     
     # Slow path: NumPy random generation (legacy method)
-    if rng is None:
-        rng = np.random.default_rng()
+    if rng is None or seed is not None:
+        # When a seed is explicitly provided, always create a fresh seeded Generator
+        # so that the seed takes effect regardless of what rng was passed by the caller.
+        rng = np.random.default_rng(seed=seed)  # seed=None = entropy
     if not np.issubdtype(dtype, np.integer):
         # Only float32 and float64 are supported by rng.random
         if dtype not in (np.float32, np.float64):
