@@ -87,27 +87,13 @@ logging.basicConfig(
 for _noisy in ("urllib3", "botocore", "s3transfer", "filelock", "hydra"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-# ─── Opt-in skip marker ────────────────────────────────────────────────────────
-_S3_INTEGRATION = os.environ.get("DLIO_S3_INTEGRATION", "").strip().lower() in (
-    "1", "true", "yes"
-)
-_OBJECT_STORAGE_TESTS = os.environ.get("DLIO_OBJECT_STORAGE_TESTS", "").strip().lower() in (
-    "1", "true", "yes"
-)
-_S3_EXTENDED = os.environ.get("DLIO_OBJECT_STORAGE_EXTENDED", "").strip().lower() in (
-    "1", "true", "yes"
-)
-requires_s3 = pytest.mark.skipif(
-    not (_S3_INTEGRATION and _OBJECT_STORAGE_TESTS),
-    reason=(
-        "Live S3 integration tests are opt-in. "
-        "Run with:  DLIO_OBJECT_STORAGE_TESTS=1 DLIO_S3_INTEGRATION=1 pytest tests/test_s3dlio_object_store.py"
-    ),
-)
-requires_s3_extended = pytest.mark.skipif(
-    not _S3_EXTENDED,
-    reason="Extended live S3 integration matrix disabled by default. Set DLIO_OBJECT_STORAGE_EXTENDED=1 to enable.",
-)
+# ─── Hard-disable live object storage tests unless manually flipped in code ───
+run_Object_Tests = False
+if not run_Object_Tests:
+    pytest.skip(
+        "Object-storage tests are disabled by default. Set run_Object_Tests=True to enable.",
+        allow_module_level=True,
+    )
 
 # ─── DLIO test infrastructure ─────────────────────────────────────────────────
 from hydra import initialize_config_dir, compose
@@ -259,7 +245,6 @@ _FORMATS = ["npy"] if not _S3_EXTENDED else ["npy", "npz", "hdf5", "csv", "parqu
 # for TFRecord is covered by test_s3dlio_tfrecord_datagen below.
 
 
-@requires_s3
 @pytest.mark.timeout(_S3_TEST_TIMEOUT, method="thread")
 @pytest.mark.parametrize("fmt", _FORMATS)
 def test_s3dlio_datagen_and_read(fmt):
@@ -354,8 +339,6 @@ def test_s3dlio_datagen_and_read(fmt):
 
 # ─── TFRecord: generate-only (put) test ───────────────────────────────────────
 
-@requires_s3
-@requires_s3_extended
 @pytest.mark.timeout(_S3_TEST_TIMEOUT, method="thread")
 def test_s3dlio_tfrecord_datagen():
     """

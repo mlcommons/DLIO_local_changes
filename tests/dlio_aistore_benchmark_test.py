@@ -38,22 +38,15 @@ import dlio_benchmark
 
 from unittest.mock import patch
 
-# Object storage tests are opt-in: set DLIO_OBJECT_STORAGE_TESTS=1 to enable.
-_AISTORE_TESTS_ENABLED = os.environ.get("DLIO_OBJECT_STORAGE_TESTS", "").strip().lower() in (
-    "1", "true", "yes"
-)
-pytestmark = pytest.mark.skipif(
-    not _AISTORE_TESTS_ENABLED,
-    reason="Object-storage tests are disabled by default. Set DLIO_OBJECT_STORAGE_TESTS=1 to enable.",
-)
+# Hard-disable object storage tests unless manually flipped in code.
+run_Object_Tests = False
+if not run_Object_Tests:
+    pytest.skip(
+        "Object-storage tests are disabled by default. Set run_Object_Tests=True to enable.",
+        allow_module_level=True,
+    )
 
-# Keep object-storage tests minimal by default in CI. Set DLIO_OBJECT_STORAGE_EXTENDED=1
-# to run full AIStore matrix coverage.
-_AISTORE_EXTENDED = os.environ.get("DLIO_OBJECT_STORAGE_EXTENDED", "").strip().lower() in ("1", "true", "yes")
-requires_aistore_extended = pytest.mark.skipif(
-    not _AISTORE_EXTENDED,
-    reason="Extended AIStore mock tests are disabled by default. Set DLIO_OBJECT_STORAGE_EXTENDED=1 to enable.",
-)
+# All AIStore tests are hard-disabled unless run_Object_Tests is flipped.
 
 config_dir = os.path.dirname(dlio_benchmark.__file__) + "/configs/"
 

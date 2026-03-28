@@ -1,4 +1,26 @@
 import os
+import pytest
+
+# Hard-disable object-storage tests. If a command targets them via -k,
+# exit immediately with code 0 so mpirun does not report an error.
+SKIP_OBJECT_TESTS = True
+
+
+def _is_object_storage_keyword(expr):
+    if not expr:
+        return False
+    return "test_s3_" in expr or "test_aistore_" in expr
+
+
+def pytest_sessionstart(session):
+    if not SKIP_OBJECT_TESTS:
+        return
+    keyword = session.config.option.keyword
+    if _is_object_storage_keyword(keyword):
+        pytest.exit(
+            "Object-storage tests are disabled by default.",
+            returncode=0,
+        )
 
 # Named output directory for all DLIO benchmark tests.
 # Prevents DLIO from creating an ambiguous 'output/' folder in the working

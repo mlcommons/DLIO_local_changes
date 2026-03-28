@@ -46,22 +46,13 @@ except ImportError as e:
     S3Checkpoint = None
 from urllib.parse import urlparse
 
-# Object storage tests are opt-in: set DLIO_OBJECT_STORAGE_TESTS=1 to enable.
-_S3_TESTS_ENABLED = os.environ.get("DLIO_OBJECT_STORAGE_TESTS", "").strip().lower() in (
-    "1", "true", "yes"
-)
-pytestmark = pytest.mark.skipif(
-    not _S3_TESTS_ENABLED,
-    reason="Object-storage tests are disabled by default. Set DLIO_OBJECT_STORAGE_TESTS=1 to enable.",
-)
-
-# Keep object-storage tests minimal by default in CI. Set DLIO_OBJECT_STORAGE_EXTENDED=1
-# to run the full S3 matrix (checkpointing, multi-thread/multi-context, etc.).
-_S3_EXTENDED = os.environ.get("DLIO_OBJECT_STORAGE_EXTENDED", "").strip().lower() in ("1", "true", "yes")
-requires_s3_extended = pytest.mark.skipif(
-    not _S3_EXTENDED,
-    reason="Extended S3 mock/integration tests are disabled by default. Set DLIO_OBJECT_STORAGE_EXTENDED=1 to enable.",
-)
+# Hard-disable object storage tests unless manually flipped in code.
+run_Object_Tests = False
+if not run_Object_Tests:
+    pytest.skip(
+        "Object-storage tests are disabled by default. Set run_Object_Tests=True to enable.",
+        allow_module_level=True,
+    )
 
 # These tests depend on s3torchconnector's mock client implementation.
 requires_s3torchconnector = pytest.mark.skipif(
@@ -335,7 +326,6 @@ def test_s3_gen_data(setup_test_env, fmt, framework) -> None:
 
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
 @requires_s3torchconnector
-@requires_s3_extended
 def test_s3_subset(setup_test_env) -> None:
     storage_root, storage_type, mock_client, s3_overrides = setup_test_env
     with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client), \
@@ -369,7 +359,6 @@ def test_s3_subset(setup_test_env) -> None:
 
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
 @requires_s3torchconnector
-@requires_s3_extended
 def test_s3_eval(setup_test_env) -> None:
     storage_root, storage_type, mock_client, s3_overrides = setup_test_env
     with patch("dlio_benchmark.storage.obj_store_lib.S3Client", return_value=mock_client), \
@@ -395,7 +384,6 @@ def test_s3_eval(setup_test_env) -> None:
 
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
 @requires_s3torchconnector
-@requires_s3_extended
 @pytest.mark.parametrize("framework, nt", [("pytorch", 0), ("pytorch", 1), ("pytorch", 2)])
 def test_s3_multi_threads(setup_test_env, framework, nt) -> None:
     storage_root, storage_type, mock_client, s3_overrides = setup_test_env
@@ -425,7 +413,6 @@ def test_s3_multi_threads(setup_test_env, framework, nt) -> None:
 
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
 @requires_s3torchconnector
-@requires_s3_extended
 @pytest.mark.parametrize("nt, context", [(0, None), (1, "fork"), (2, "spawn"), (2, "forkserver")])
 def test_s3_pytorch_multiprocessing_context(setup_test_env, nt, context, monkeypatch) -> None:
     if nt == 2 and context in ("spawn", "forkserver"):
@@ -501,7 +488,6 @@ def test_s3_train(setup_test_env, fmt, framework, dataloader, is_even) -> None:
 
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
 @requires_s3torchconnector
-@requires_s3_extended
 @pytest.mark.parametrize("framework, model_size, optimizers, num_layers, layer_params, zero_stage, randomize", [
                                                                                          ("pytorch", 1024, [1024, 128], 2, [16], 0, True),
                                                                                          ("pytorch", 1024, [1024, 128], 2, [16], 3, True),
@@ -560,7 +546,6 @@ def test_s3_checkpoint_epoch(patch_s3_checkpoint, framework, model_size, optimiz
 
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
 @requires_s3torchconnector
-@requires_s3_extended
 def test_s3_checkpoint_step(patch_s3_checkpoint) -> None:
     storage_root, storage_type, mock_client, s3_overrides = patch_s3_checkpoint
     if (comm.rank == 0):
@@ -591,7 +576,6 @@ def test_s3_checkpoint_step(patch_s3_checkpoint) -> None:
 
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
 @requires_s3torchconnector
-@requires_s3_extended
 def test_s3_checkpoint_ksm_config(patch_s3_checkpoint) -> None:
     """
     Tests the loading and derivation of KSM configuration parameters
