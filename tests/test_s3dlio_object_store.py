@@ -91,12 +91,19 @@ for _noisy in ("urllib3", "botocore", "s3transfer", "filelock", "hydra"):
 _S3_INTEGRATION = os.environ.get("DLIO_S3_INTEGRATION", "").strip().lower() in (
     "1", "true", "yes"
 )
+_S3_EXTENDED = os.environ.get("DLIO_OBJECT_STORAGE_EXTENDED", "").strip().lower() in (
+    "1", "true", "yes"
+)
 requires_s3 = pytest.mark.skipif(
     not _S3_INTEGRATION,
     reason=(
         "Live S3 integration tests are opt-in. "
         "Run with:  DLIO_S3_INTEGRATION=1 pytest tests/test_s3dlio_object_store.py"
     ),
+)
+requires_s3_extended = pytest.mark.skipif(
+    not _S3_EXTENDED,
+    reason="Extended live S3 integration matrix disabled by default. Set DLIO_OBJECT_STORAGE_EXTENDED=1 to enable.",
 )
 
 # ─── DLIO test infrastructure ─────────────────────────────────────────────────
@@ -243,7 +250,7 @@ def _base_overrides(bucket: str, prefix: str, fmt: str,
 # Integration test: datagen (put) + list (verify) + train (get) for each format
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_FORMATS = ["npy", "npz", "hdf5", "csv", "parquet", "jpeg", "png"]
+_FORMATS = ["npy"] if not _S3_EXTENDED else ["npy", "npz", "hdf5", "csv", "parquet", "jpeg", "png"]
 # TFRecord excluded: reading requires framework=tensorflow which routes through
 # S3Storage (bare boto3), not ObjStoreLibStorage (s3dlio).  Generate-only test
 # for TFRecord is covered by test_s3dlio_tfrecord_datagen below.
@@ -345,6 +352,7 @@ def test_s3dlio_datagen_and_read(fmt):
 # ─── TFRecord: generate-only (put) test ───────────────────────────────────────
 
 @requires_s3
+@requires_s3_extended
 @pytest.mark.timeout(_S3_TEST_TIMEOUT, method="thread")
 def test_s3dlio_tfrecord_datagen():
     """
