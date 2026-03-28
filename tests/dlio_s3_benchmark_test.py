@@ -46,6 +46,15 @@ except ImportError as e:
     S3Checkpoint = None
 from urllib.parse import urlparse
 
+# Object storage tests are opt-in: set DLIO_OBJECT_STORAGE_TESTS=1 to enable.
+_S3_TESTS_ENABLED = os.environ.get("DLIO_OBJECT_STORAGE_TESTS", "").strip().lower() in (
+    "1", "true", "yes"
+)
+pytestmark = pytest.mark.skipif(
+    not _S3_TESTS_ENABLED,
+    reason="Object-storage tests are disabled by default. Set DLIO_OBJECT_STORAGE_TESTS=1 to enable.",
+)
+
 # Keep object-storage tests minimal by default in CI. Set DLIO_OBJECT_STORAGE_EXTENDED=1
 # to run the full S3 matrix (checkpointing, multi-thread/multi-context, etc.).
 _S3_EXTENDED = os.environ.get("DLIO_OBJECT_STORAGE_EXTENDED", "").strip().lower() in ("1", "true", "yes")

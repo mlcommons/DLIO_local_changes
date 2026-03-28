@@ -91,14 +91,17 @@ for _noisy in ("urllib3", "botocore", "s3transfer", "filelock", "hydra"):
 _S3_INTEGRATION = os.environ.get("DLIO_S3_INTEGRATION", "").strip().lower() in (
     "1", "true", "yes"
 )
+_OBJECT_STORAGE_TESTS = os.environ.get("DLIO_OBJECT_STORAGE_TESTS", "").strip().lower() in (
+    "1", "true", "yes"
+)
 _S3_EXTENDED = os.environ.get("DLIO_OBJECT_STORAGE_EXTENDED", "").strip().lower() in (
     "1", "true", "yes"
 )
 requires_s3 = pytest.mark.skipif(
-    not _S3_INTEGRATION,
+    not (_S3_INTEGRATION and _OBJECT_STORAGE_TESTS),
     reason=(
         "Live S3 integration tests are opt-in. "
-        "Run with:  DLIO_S3_INTEGRATION=1 pytest tests/test_s3dlio_object_store.py"
+        "Run with:  DLIO_OBJECT_STORAGE_TESTS=1 DLIO_S3_INTEGRATION=1 pytest tests/test_s3dlio_object_store.py"
     ),
 )
 requires_s3_extended = pytest.mark.skipif(
