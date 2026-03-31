@@ -372,8 +372,8 @@ class ObjStoreLibStorage(S3Storage):
 
     # Threshold above which s3dlio uses MultipartUploadWriter instead of put_bytes.
     # minio-py uses 5 MiB; 16 MiB is a good balance for MinIO with large objects.
-    # Override via S3DLIO_MULTIPART_THRESHOLD_MiB env var (set before import).
-    _MULTIPART_THRESHOLD = int(os.environ.get("S3DLIO_MULTIPART_THRESHOLD_MiB", "16")) * 1024 * 1024
+    # Override via S3DLIO_MULTIPART_THRESHOLD_MB env var (set before import).
+    _MULTIPART_THRESHOLD = int(os.environ.get("S3DLIO_MULTIPART_THRESHOLD_MB", "16")) * 1024 * 1024
 
     @dlp.log
     def put_data(self, id, data, offset=None, length=None):
