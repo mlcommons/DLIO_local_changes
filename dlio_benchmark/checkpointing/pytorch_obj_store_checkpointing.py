@@ -204,7 +204,7 @@ class PyTorchObjStoreCheckpointing(PyTorchCheckpointing):
             #   14.96 GiB object) but at the cost of pipeline stalls.
             #
             # Tuning levers:
-            #   S3DLIO_MULTIPART_PART_SIZE_MiB  — part size in MiB (default: 16)
+            #   S3DLIO_MULTIPART_PART_SIZE_MB  — part size in MiB (default: 16)
             #       Larger parts → fewer semaphore trips but each stall lasts longer.
             #       Smaller parts + more max_in_flight → more concurrent MinIO connections.
             #   S3DLIO_MULTIPART_MAX_IN_FLIGHT — concurrent upload slots (default: 16)
@@ -225,7 +225,7 @@ class PyTorchObjStoreCheckpointing(PyTorchCheckpointing):
             #   Until that fix lands, maximising max_in_flight within memory budget
             #   is the best available workaround.
             #
-            _part_size_mib   = int(os.environ.get("S3DLIO_MULTIPART_PART_SIZE_MiB",  "128"))
+            _part_size_mib   = int(os.environ.get("S3DLIO_MULTIPART_PART_SIZE_MB",  "128"))
             _max_in_flight  = int(os.environ.get("S3DLIO_MULTIPART_MAX_IN_FLIGHT", "8"))
             streaming_kwargs.update(
                 part_size=_part_size_mib * 1024 * 1024,
