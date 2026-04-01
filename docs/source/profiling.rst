@@ -187,15 +187,15 @@ The output is
     2023-06-27 21:38:00 Extracting stats for epoch 5 start
     2023-06-27 21:38:00 Extracting stats for epoch 5 block1
     2023-06-27 21:38:00 Extracting stats for epoch 5 ckpt1
-    2023-06-27 21:38:00 Less than 2 data points for rMiB/s
-    2023-06-27 21:38:00 Less than 2 data points for wMiB/s
+    2023-06-27 21:38:00 Less than 2 data points for rMB/s
+    2023-06-27 21:38:00 Less than 2 data points for wMB/s
     2023-06-27 21:38:00 Less than 2 data points for r/s
     2023-06-27 21:38:00 Less than 2 data points for w/s
     2023-06-27 21:38:00 Less than 2 data points for r_await
     2023-06-27 21:38:00 Less than 2 data points for w_await
     2023-06-27 21:38:00 Less than 2 data points for aqu-sz
-    2023-06-27 21:38:00 Less than 2 data points for rMiB/s
-    2023-06-27 21:38:00 Less than 2 data points for wMiB/s
+    2023-06-27 21:38:00 Less than 2 data points for rMB/s
+    2023-06-27 21:38:00 Less than 2 data points for wMB/s
     2023-06-27 21:38:00 Less than 2 data points for r/s
     2023-06-27 21:38:00 Less than 2 data points for w/s
     2023-06-27 21:38:00 Less than 2 data points for r_await
