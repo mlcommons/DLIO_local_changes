@@ -498,27 +498,32 @@ class ConfigArguments:
         if self.generate_data or self.do_checkpoint:
             from dlio_benchmark.utils.utility import HAS_DGEN
             method = self.data_gen_method.lower()
-            if method == 'numpy':
-                # Only reachable via explicit DLIO_DATA_GEN=numpy — warn loudly.
-                self.logger.output(f"{'='*80}")
-                self.logger.output(f"WARNING: Data Generation Method: NUMPY (Slow Legacy Path)")
-                self.logger.output(f"  Using NumPy random generation — 155x SLOWER than dgen-py")
-                self.logger.output(f"  This path is for explicit comparison benchmarks ONLY.")
-                self.logger.output(f"  Remove DLIO_DATA_GEN=numpy to restore dgen-py (default).")
-                self.logger.output(f"{'='*80}")
-            elif not HAS_DGEN:
-                # dgen is the default but dgen-py is not installed — warn and fall back.
-                self.logger.warning(
-                    "dgen-py is not installed — falling back to NumPy for data generation "
-                    "(~155x slower). Install dgen-py>=0.2.0 (requires Python>=3.11) for "
-                    "full performance, or set DLIO_DATA_GEN=numpy to suppress this warning."
-                )
+            
+            if method != 'numpy' and not HAS_DGEN:
                 self.data_gen_method = 'numpy'
-            else:
-                self.logger.output(f"{'='*80}")
-                self.logger.output(f"Data Generation Method: DGEN (default)")
-                self.logger.output(f"  dgen-py zero-copy BytesView — 155x faster than NumPy, 0 MiB overhead")
-                self.logger.output(f"{'='*80}")
+
+            if DLIOMPI.get_instance().rank() == 0:
+                if method == 'numpy':
+                    # Only reachable via explicit DLIO_DATA_GEN=numpy — warn loudly.
+                    self.logger.output(f"{'='*80}")
+                    self.logger.output(f"WARNING: Data Generation Method: NUMPY (Slow Legacy Path)")
+                    self.logger.output(f"  Using NumPy random generation — 155x SLOWER than dgen-py")
+                    self.logger.output(f"  This path is for explicit comparison benchmarks ONLY.")
+                    self.logger.output(f"  Remove DLIO_DATA_GEN=numpy to restore dgen-py (default).")
+                    self.logger.output(f"{'='*80}")
+                elif not HAS_DGEN:
+                    # dgen is the default but dgen-py is not installed — warn and fall back.
+                    self.logger.warning(
+                        "dgen-py is not installed — falling back to NumPy for data generation "
+                        "(~155x slower). Install dgen-py>=0.2.0 (requires Python>=3.11) for "
+                        "full performance, or set DLIO_DATA_GEN=numpy to suppress this warning."
+                    )
+                    
+                else:
+                    self.logger.output(f"{'='*80}")
+                    self.logger.output(f"Data Generation Method: DGEN (default)")
+                    self.logger.output(f"  dgen-py zero-copy BytesView — 155x faster than NumPy, 0 MiB overhead")
+                    self.logger.output(f"{'='*80}")
         
         if self.checkpoint_mechanism == CheckpointMechanismType.NONE:
             if self.framework == FrameworkType.TENSORFLOW:

@@ -70,19 +70,6 @@ class DLIOBenchmark(object):
         self.args = ConfigArguments.get_instance()
         LoadConfig(self.args, cfg)
 
-        print(f"[DEBUG DLIOBenchmark.__init__] After LoadConfig:")
-        print(f"  storage_type   = {self.args.storage_type!r}")
-        print(f"  storage_root   = {self.args.storage_root!r}")
-        print(f"  storage_options= {self.args.storage_options!r}")
-        print(f"  data_folder    = {self.args.data_folder!r}")
-        print(f"  framework      = {self.args.framework!r}")
-        print(f"  num_files_train= {self.args.num_files_train!r}")
-        print(f"  record_length  = {self.args.record_length!r}")
-        print(f"  generate_data  = {self.args.generate_data!r}")
-        print(f"  do_train       = {self.args.do_train!r}")
-        print(f"  do_checkpoint  = {self.args.do_checkpoint!r}")
-        print(f"  epochs         = {self.args.epochs!r}")
-        print(f"  batch_size     = {self.args.batch_size!r}")
 
         self.storage = StorageFactory().get_storage(self.args.storage_type, self.args.storage_root,
                                                     self.args.framework)
@@ -107,6 +94,22 @@ class DLIOBenchmark(object):
         # Configure the logging library
         self.args.configure_dlio_logging(is_child=False)
         self.logger = DLIOLogger.get_instance()
+
+        if self.my_rank == 0:
+            self.logger.output(f"[DEBUG DLIOBenchmark.__init__] After LoadConfig:")
+            self.logger.output(f"  storage_type   = {self.args.storage_type!r}")
+            self.logger.output(f"  storage_root   = {self.args.storage_root!r}")
+            self.logger.output(f"  storage_options= {self.args.storage_options!r}")
+            self.logger.output(f"  data_folder    = {self.args.data_folder!r}")
+            self.logger.output(f"  framework      = {self.args.framework!r}")
+            self.logger.output(f"  num_files_train= {self.args.num_files_train!r}")
+            self.logger.output(f"  record_length  = {self.args.record_length!r}")
+            self.logger.output(f"  generate_data  = {self.args.generate_data!r}")
+            self.logger.output(f"  do_train       = {self.args.do_train!r}")
+            self.logger.output(f"  do_checkpoint  = {self.args.do_checkpoint!r}")
+            self.logger.output(f"  epochs         = {self.args.epochs!r}")
+            self.logger.output(f"  batch_size     = {self.args.batch_size!r}")
+        
         if dftracer_initialize:
             dftracer = self.args.configure_dftracer(is_child=False, use_pid=False)
         with Profile(name=f"{self.__init__.__qualname__}", cat=MODULE_DLIO_BENCHMARK):
