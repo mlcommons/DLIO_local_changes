@@ -182,6 +182,12 @@ class ConfigArguments:
     record_element_bytes: int = 4
     record_element_dtype: ClassVar[np.dtype] = np.dtype("uint8")
 
+    ## dataset: parquet-only
+    parquet_columns: ClassVar[List[Dict[str, Any]]] = []
+    parquet_row_group_size: int = 1024
+    parquet_partition_by: Optional[str] = None
+    parquet_generation_batch_size: int = 0
+
     ## dataset: hdf5-only
     num_dset_per_record: int = 1
     chunk_dims: ClassVar[List[int]] = []
@@ -1122,6 +1128,19 @@ def LoadConfig(args, config):
             args.record_element_type = config['dataset']['record_element_type']
         if 'record_dims' in config['dataset']:
             args.record_dims = list(config['dataset']['record_dims'])
+
+        # parquet only config
+        if 'parquet' in config['dataset']:
+            pq_cfg = config['dataset']['parquet']
+            if 'columns' in pq_cfg:
+                cols = pq_cfg['columns']
+                args.parquet_columns = [dict(c) if hasattr(c, 'items') else c for c in cols]
+            if 'row_group_size' in pq_cfg:
+                args.parquet_row_group_size = int(pq_cfg['row_group_size'])
+            if 'partition_by' in pq_cfg:
+                args.parquet_partition_by = str(pq_cfg['partition_by'])
+            if 'generation_batch_size' in pq_cfg:
+                args.parquet_generation_batch_size = int(pq_cfg['generation_batch_size'])
 
         # hdf5 only config
         if 'hdf5' in config['dataset']:
