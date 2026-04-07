@@ -50,7 +50,6 @@ class StatsCounter(object):
         self.my_rank = self.args.my_rank
         self.comm_size = self.args.comm_size
         self.output_folder = self.args.output_folder
-        self.record_size = self.args.record_length
         self.batch_size = self.args.batch_size
         self.batch_size_eval = self.args.batch_size_eval
         self.checkpoint_size = 0.0
@@ -121,23 +120,7 @@ class StatsCounter(object):
         self.eval_au = []
         self.train_throughput = []
         self.eval_throughput = []
-        # Compute effective per-sample size: use parquet column specs when
-        # available, otherwise fall back to the legacy record_length field.
-        parquet_cols = getattr(self.args, 'parquet_columns', [])
-        if parquet_cols:
-            _DTYPE_BYTES = {
-                'float64': 8, 'int64': 8, 'uint64': 8,
-                'float32': 4, 'int32': 4, 'uint32': 4,
-                'float16': 2, 'int16': 2, 'uint16': 2,
-                'uint8': 1, 'int8': 1, 'bool': 1,
-            }
-            effective_record_length = sum(
-                int(c.get('size', 1)) * _DTYPE_BYTES.get(c.get('dtype', 'float32'), 4)
-                for c in parquet_cols
-            )
-        else:
-            effective_record_length = self.args.record_length
-        data_per_node = self.MPI.npernode()*self.args.num_samples_per_file * self.args.num_files_train//self.MPI.size()*effective_record_length
+        data_per_node = self.MPI.npernode()*self.args.num_samples_per_file * self.args.num_files_train//self.MPI.size()*self.record_size
         self.summary['data_size_per_host_GB'] = data_per_node/1024./1024./1024.
         if self.MPI.rank() == 0 and self.args.do_train:
             self.logger.info(f"Total amount of data each host will consume is {data_per_node/1024./1024./1024} GiB; each host has {self.summary['host_memory_GB']} GiB memory") 
@@ -152,6 +135,27 @@ class StatsCounter(object):
             else:
                 potential_caching.append(1)
         self.summary['potential_caching'] = potential_caching
+
+    @property
+    def record_size(self):
+        """Return the effective per-sample size in bytes.
+
+        Uses parquet column specs when available, otherwise falls back to
+        the legacy record_length field.
+        """
+        parquet_cols = getattr(self.args, 'parquet_columns', [])
+        if parquet_cols:
+            _DTYPE_BYTES = {
+                'float64': 8, 'int64': 8, 'uint64': 8,
+                'float32': 4, 'int32': 4, 'uint32': 4,
+                'float16': 2, 'int16': 2, 'uint16': 2,
+                'uint8': 1, 'int8': 1, 'bool': 1,
+            }
+            return sum(
+                int(c.get('size', 1)) * _DTYPE_BYTES.get(c.get('dtype', 'float32'), 4)
+                for c in parquet_cols
+            )
+        return self.args.record_length
 
     def start_run(self):
         self.start_run_timestamp = time()
