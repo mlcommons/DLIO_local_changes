@@ -303,6 +303,16 @@ class ParquetGenerator(DataGenerator):
                 writer_target = pa.BufferOutputStream()
 
             with pq.ParquetWriter(writer_target, schema, compression=compression) as writer:
+                # Generate all column data upfront for the entire file.
+                # This reduces function call overhead from (num_batches * num_columns)
+                # to just num_columns calls to gen_random_tensor.
+                if self.parquet_columns:
+                    full_columns = self._generate_batch_columns(self.num_samples, rng)
+                else:
+                    full_columns = self._generate_legacy_batch(elem_size, self.num_samples, rng)
+
+                full_table = pa.table(full_columns)
+
                 num_batches = (
                     self.num_samples + self.generation_batch_size - 1
                 ) // self.generation_batch_size
@@ -312,13 +322,8 @@ class ParquetGenerator(DataGenerator):
                     batch_end = min(batch_start + self.generation_batch_size, self.num_samples)
                     current_batch_size = batch_end - batch_start
 
-                    # rng advances per batch — each batch gets unique data.
-                    if self.parquet_columns:
-                        columns = self._generate_batch_columns(current_batch_size, rng)
-                    else:
-                        columns = self._generate_legacy_batch(elem_size, current_batch_size, rng)
-
-                    batch_table = pa.table(columns)
+                    # Slice the pre-generated table for this batch (zero-copy).
+                    batch_table = full_table.slice(batch_start, current_batch_size)
                     writer.write_table(batch_table, row_group_size=self.row_group_size)
 
             if not is_local:
