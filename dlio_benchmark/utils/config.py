@@ -188,6 +188,10 @@ class ConfigArguments:
     parquet_partition_by: Optional[str] = None
     parquet_generation_batch_size: int = 0
 
+    ## dataset: arrow-only
+    arrow_columns: ClassVar[List[Dict[str, Any]]] = []
+    arrow_generation_batch_size: int = 0
+
     ## dataset: hdf5-only
     num_dset_per_record: int = 1
     chunk_dims: ClassVar[List[int]] = []
@@ -1146,6 +1150,15 @@ def LoadConfig(args, config):
                 args.parquet_partition_by = str(pq_cfg['partition_by'])
             if 'generation_batch_size' in pq_cfg:
                 args.parquet_generation_batch_size = int(pq_cfg['generation_batch_size'])
+
+        # arrow only config
+        if 'arrow' in config['dataset']:
+            ar_cfg = config['dataset']['arrow']
+            if 'columns' in ar_cfg:
+                cols = ar_cfg['columns']
+                args.arrow_columns = [dict(c) if hasattr(c, 'items') else c for c in cols]
+            if 'generation_batch_size' in ar_cfg:
+                args.arrow_generation_batch_size = int(ar_cfg['generation_batch_size'])
 
         # hdf5 only config
         if 'hdf5' in config['dataset']:
