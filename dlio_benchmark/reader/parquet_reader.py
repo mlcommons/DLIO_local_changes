@@ -17,6 +17,7 @@ Configuration (under storage_options in the DLIO YAML):
   row_group_cache_size: 4     # max row groups held in memory per reader thread
   metadata_cache:       true  # cache parquet footer metadata across opens
   memory_map:           true  # use memory-mapped I/O
+  file_cache:           true  # keep 1 ParquetFile open across close/open calls
 
 Example YAML snippet:
   dataset:
@@ -64,6 +65,7 @@ class ParquetReader(FormatReader):
         # Configuration flags
         self._use_metadata_cache = opts.get("metadata_cache", True)
         self._use_memory_map = opts.get("memory_map", True)
+        self._use_file_cache = opts.get("file_cache", True)
 
         # Metadata cache: filename -> (FileMetaData, cumulative_offsets)
         # Caches parquet footer metadata to avoid re-reading it on every open
@@ -77,10 +79,15 @@ class ParquetReader(FormatReader):
         self._rg_cache: dict = {}
         self._rg_lru: list = []  # insertion-order LRU key list
 
+        # File cache: keeps at most 1 ParquetFile open across close/open cycles
+        # Stored as (filename, (pf, offsets)) or None
+        self._file_cache = None
+
         self.logger.info(
             f"{utcnow()} ParquetReader thread={thread_index} epoch={epoch} "
             f"columns={self._columns} rg_cache_size={self._rg_cache_size} "
-            f"metadata_cache={self._use_metadata_cache} memory_map={self._use_memory_map}"
+            f"metadata_cache={self._use_metadata_cache} memory_map={self._use_memory_map} "
+            f"file_cache={self._use_file_cache}"
         )
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -90,6 +97,14 @@ class ParquetReader(FormatReader):
         if self._rg_lru:
             oldest = self._rg_lru.pop(0)
             self._rg_cache.pop(oldest, None)
+
+    def _evict_rg_for_file(self, filename):
+        """Drop all row-group cache entries belonging to ``filename``."""
+        keys_to_remove = [k for k in self._rg_cache if k[0] == filename]
+        for k in keys_to_remove:
+            self._rg_cache.pop(k, None)
+            if k in self._rg_lru:
+                self._rg_lru.remove(k)
 
     # ── FormatReader interface ────────────────────────────────────────────────
 
@@ -104,8 +119,20 @@ class ParquetReader(FormatReader):
         
         With metadata_cache=True, caches parquet metadata (footer) to avoid re-reading.
         With memory_map=True, uses memory-mapped I/O for faster access.
+        With file_cache=True, returns a cached ParquetFile handle if the same
+        file was the last one closed, avoiding any re-open work.
         """
         import pyarrow.parquet as pq
+
+        # File cache hit: same file as the last one we kept open
+        if self._use_file_cache and self._file_cache is not None and self._file_cache[0] == filename:
+            return self._file_cache[1]
+
+        # File cache miss with a different file cached: evict it now
+        if self._use_file_cache and self._file_cache is not None:
+            old_filename = self._file_cache[0]
+            self._evict_rg_for_file(old_filename)
+            self._file_cache = None
 
         cached_meta = None
         cached_offsets = None
@@ -136,17 +163,29 @@ class ParquetReader(FormatReader):
             # Cache the metadata and offsets
             if self._use_metadata_cache:
                 self._metadata_cache[filename] = (meta, offsets)
-        
-        return (pf, offsets)
+
+        handle = (pf, offsets)
+
+        # Populate the 1-slot file cache
+        if self._use_file_cache:
+            self._file_cache = (filename, handle)
+
+        return handle
 
     @dlp.log
     def close(self, filename):
-        """Evict cached row groups for this file to free memory."""
-        keys_to_remove = [k for k in self._rg_cache if k[0] == filename]
-        for k in keys_to_remove:
-            self._rg_cache.pop(k, None)
-            if k in self._rg_lru:
-                self._rg_lru.remove(k)
+        """
+        Close ``filename`` and evict its row-group cache entries.
+
+        With ``file_cache`` enabled, the most recently used file is kept open;
+        the actual close/eviction is deferred until a different file is opened
+        (handled in :meth:`open`) or until :meth:`finalize` runs.
+        """
+        if self._use_file_cache and self._file_cache is not None and self._file_cache[0] == filename:
+            # Keep this file open in the 1-slot file cache
+            return
+
+        self._evict_rg_for_file(filename)
         super().close(filename)
 
     @dlp.log
@@ -203,6 +242,7 @@ class ParquetReader(FormatReader):
     def finalize(self):
         self._rg_cache.clear()
         self._rg_lru.clear()
+        self._file_cache = None
         return super().finalize()
 
     def is_index_based(self):
