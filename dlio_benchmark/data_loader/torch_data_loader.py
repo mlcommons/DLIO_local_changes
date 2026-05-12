@@ -307,6 +307,108 @@ class TorchIterableDataset(IterableDataset):
         )
 
 
+class TorchIterableDatasetSimple(IterableDataset):
+    """
+    IterableDataset for 1-sample-per-file formats (NPZ / NPY / JPEG / PNG) on
+    any storage backend (S3 object store or local / POSIX filesystem).
+
+    Problem with map-style (TorchDataset) for these formats:
+      Each worker calls __getitem__ → read_index() → on-demand single-object GET.
+      With N workers the server sees at most N simultaneous requests.
+
+    This class instead calls reader.next(), which:
+      S3   — _s3_prefetch_all()      → s3dlio.get_many(64 in-flight per worker)
+      POSIX — _localfs_prefetch_all() → ThreadPoolExecutor(64 workers)
+
+    Effective pipeline depth: 64 × num_workers  (vs 1 × num_workers before).
+
+    File assignment:
+      Worker k handles files[k::num_workers] from the epoch's file list.
+      The list reflects any epoch-level shuffle already applied by reconfigure().
+      No additional shuffle is performed here; for storage I/O benchmarking,
+      file ordering within a worker's shard does not affect measured throughput.
+
+    Drop-last semantics:
+      FormatReader.next() drops the final partial batch (same as map-style
+      drop_last=True). The DataLoader is configured with batch_size=None because
+      the reader assembles batches internally; one 'dummy' item is yielded per
+      complete batch.
+    """
+
+    @dlp.log_init
+    def __init__(self, format_type, dataset_type, epoch, batch_size, num_workers):
+        self.format_type = format_type
+        self.dataset_type = dataset_type
+        self.epoch_number = epoch
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.reader = None
+        args = ConfigArguments.get_instance()
+        self.serial_args = pickle.dumps(args)
+        if num_workers == 0:
+            self.worker_init(-1)
+
+    @dlp.log
+    def worker_init(self, worker_id):
+        pickle.loads(self.serial_args)
+        _args = ConfigArguments.get_instance()
+        _args.configure_dlio_logging(is_child=True)
+        # When num_workers=0 the training loop runs in the main process;
+        # file_map is built for thread 0 (num_threads=1 when read_threads=0).
+        thread_idx = 0 if worker_id < 0 else worker_id
+        self.reader = ReaderFactory.get_reader(
+            type=self.format_type,
+            dataset_type=self.dataset_type,
+            thread_index=thread_idx,
+            epoch_number=self.epoch_number,
+        )
+
+    def __iter__(self):
+        args = ConfigArguments.get_instance()
+        dummy = args.resized_image
+        worker_info = torch.utils.data.get_worker_info()
+
+        # Shard files: worker k handles every k-th file starting at offset k.
+        # _file_list = args.file_list_train, updated each epoch by reconfigure().
+        all_files = list(self.reader._file_list)
+        if worker_info is not None:
+            my_files = all_files[worker_info.id::worker_info.num_workers]
+        else:
+            my_files = all_files
+
+        wid = worker_info.id if worker_info is not None else 0
+        reader_type = type(self.reader).__name__
+        print(
+            f"[ITER_SIMPLE] worker={wid} reader={reader_type} "
+            f"files_this_worker={len(my_files)} total_files={len(all_files)}",
+            flush=True,
+        )
+
+        if not my_files:
+            return
+
+        # Install the file shard into the reader's file_map so reader.next()
+        # picks it up. Entry format: (global_sample_idx, filename, sample_in_file).
+        num_spf = args.num_samples_per_file
+        entries = [
+            (i * num_spf + s, filename, s)
+            for i, filename in enumerate(my_files)
+            for s in range(num_spf)
+        ]
+        self.reader.file_map[self.reader.thread_index] = entries
+
+        # reader.next() bulk-prefetches all files in this worker's shard, then
+        # iterates them yielding one numpy batch per batch_size samples.
+        # We yield one dummy item per batch so the DataLoader step count is correct.
+        for _batch in self.reader.next():
+            yield dummy
+
+    @dlp.log
+    def finalize(self):
+        if self.reader is not None:
+            self.reader.finalize()
+
+
 class dlio_sampler(Sampler):
     def __init__(self, rank, size, num_samples, epochs):
         self.size = size
@@ -337,24 +439,109 @@ class TorchDataLoader(BaseDataLoader):
     @dlp.log
     def read(self):
         from dlio_benchmark.common.enumerations import FormatType, StorageType
-        # Use the RG-granular IterableDataset for parquet-on-S3 workloads.
-        # This reduces per-epoch Python calls from num_samples (64M) to
-        # num_rgs/num_workers (~984), eliminating the 212-second Python overhead.
-        use_iterable = (
+        from dlio_benchmark.reader.reader_factory import ReaderFactory
+
+        # ── Dataset routing ──────────────────────────────────────────────────
+        # Three paths, in priority order:
+        #
+        # 1. PARQUET on any storage → TorchIterableDataset (RG-granular)
+        #    Reduces Python __getitem__ calls from O(samples) to O(row_groups).
+        #
+        # 2. NPZ / NPY / JPEG / PNG → TorchIterableDatasetSimple (bulk-prefetch)
+        #    reader.next() calls _s3_prefetch_all() or _localfs_prefetch_all()
+        #    before iteration, giving 64 × num_workers in-flight I/O requests
+        #    instead of 1 × num_workers with map-style on-demand fetching.
+        #    Works for BOTH object storage and POSIX/local filesystem.
+        #
+        # 3. Everything else → TorchDataset (map-style, on-demand per sample)
+
+        _simple_iterable_formats = (
+            FormatType.NPZ, FormatType.NPY, FormatType.JPEG, FormatType.PNG
+        )
+        use_rg_iterable_dataset = (
             self.format_type is FormatType.PARQUET
             and self._args.storage_type in (
                 StorageType.S3, StorageType.AISTORE,
                 StorageType.LOCAL_FS,
             )
         )
+        use_simple_iterable_dataset = (
+            self.format_type in _simple_iterable_formats
+            and not use_rg_iterable_dataset
+        )
+
+        # Determine concrete reader class name and access pattern for logging.
+        _opts = getattr(self._args, "storage_options", {}) or {}
+        _lib  = _opts.get("storage_library", "none")
+        _st   = self._args.storage_type
+        _s3_types = (StorageType.S3, StorageType.AISTORE)
+        _s3_libs  = ("s3dlio", "s3torchconnector", "minio")
+        _nw = self._args.read_threads
+
+        if use_rg_iterable_dataset:
+            _reader_cls    = "ParquetReaderS3dlio"
+            _torch_ds      = "TorchIterableDataset(rg-granular)"
+            _sample_access = "iterator(row-group chunks)"
+        elif use_simple_iterable_dataset:
+            _fmt = str(self.format_type).split(".")[-1].lower()
+            if _st in _s3_types and _lib in _s3_libs:
+                _reader_cls = (
+                    "NPZReaderS3Iterable"   if self.format_type is FormatType.NPZ  else
+                    "NPYReaderS3Iterable"   if self.format_type is FormatType.NPY  else
+                    "ImageReaderS3Iterable"
+                )
+                _sample_access = "next()→_s3_prefetch_all(64 in-flight) then iterate"
+            else:
+                _reader_cls = (
+                    "NPZReaderIterable"    if self.format_type is FormatType.NPZ  else
+                    "NPYReaderIterable"    if self.format_type is FormatType.NPY  else
+                    "ImageReaderIterable"
+                )
+                _sample_access = "next()→_localfs_prefetch_all(ThreadPool-64) then iterate"
+            _torch_ds = f"TorchIterableDatasetSimple(bulk-prefetch, {_nw} workers)"
+        else:
+            _reader_cls    = "unknown"
+            _torch_ds      = f"TorchDataset(map-style, {_nw} workers)"
+            _sample_access = "read_index (on-demand)"
+
         print(
-            f"[DATALOADER] format={self.format_type} storage={self._args.storage_type} "
-            f"storage_library={(getattr(self._args, 'storage_options', {}) or {}).get('storage_library', 'none')} "
-            f"use_iterable={use_iterable}",
+            f"[DATALOADER] format={self.format_type} storage={_st} library={_lib}\n"
+            f"[DATALOADER]   torch_dataset={_torch_ds}\n"
+            f"[DATALOADER]   reader={_reader_cls}\n"
+            f"[DATALOADER]   sample_access={_sample_access}",
             flush=True,
         )
 
-        if use_iterable:
+        if use_simple_iterable_dataset:
+            num_workers = self._args.read_threads
+            dataset = TorchIterableDatasetSimple(
+                self.format_type, self.dataset_type, self.epoch_number,
+                self.batch_size, num_workers,
+            )
+            if self._args.my_rank == 0:
+                self.logger.debug(
+                    f"{utcnow()} Using TorchIterableDatasetSimple: "
+                    f"{num_workers} workers, batch_size={self.batch_size}, "
+                    f"reader={_reader_cls}"
+                )
+            if num_workers == 0:
+                kwargs = {}
+            else:
+                kwargs = {'multiprocessing_context': self._args.multiprocessing_context}
+                if torch.__version__ != '1.3.1':
+                    kwargs['persistent_workers'] = True
+            pin_memory = self._args.pin_memory and torch.cuda.is_available()
+            self._dataset = DataLoader(
+                dataset,
+                batch_size=None,          # reader assembles batches; one dummy per batch
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                worker_init_fn=dataset.worker_init,
+                **kwargs,
+            )
+            return
+
+        if use_rg_iterable_dataset:
             opts = getattr(self._args, "storage_options", {}) or {}
             simulate = str(opts.get("simulate_io", "false")).lower() in ("true", "1", "yes")
             # For simulate: run single-process — no multiprocessing IPC overhead.
@@ -457,9 +644,17 @@ class TorchDataLoader(BaseDataLoader):
         # When read_threads=0 the reader lives in-process on the dataset object.
         # Call its finalize() so per-epoch state (byte counters, etc.) is flushed
         # back to ConfigArguments before statscounter computes the I/O metric.
+        # When read_threads>0 each worker is a separate process; their readers are
+        # not accessible here.  The workers call finalize_s3_bytes() internally
+        # (logging actual bytes), but cannot update the main-process args.record_length.
+        # The config.py fix (guarding record_dims overwrite) ensures the correct
+        # record_length_bytes value from the YAML is used in that case.
         try:
             dataset = self._dataset.dataset
-            if dataset.reader is not None:
+            # TorchIterableDatasetSimple exposes finalize() directly.
+            if isinstance(dataset, TorchIterableDatasetSimple):
+                dataset.finalize()
+            elif dataset.reader is not None:
                 dataset.reader.finalize()
         except Exception:
             pass

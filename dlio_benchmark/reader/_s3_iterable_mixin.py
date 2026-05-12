@@ -114,6 +114,10 @@ class _S3IterableMixin:
         self._opts: dict = opts
         self._object_cache: dict = {}   # obj_key → int (raw byte count only)
         self._minio_client = None       # cached across epochs for TCP keep-alive
+        # Actual bytes received from storage this epoch (reset in finalize_s3_bytes).
+        # Incremented in _prefetch() from real len(data) — not a configured estimate.
+        self._total_bytes_read: int = 0
+        self._total_objects_read: int = 0
 
         if self._storage_library == "s3dlio":
             # s3dlio reads AWS_ENDPOINT_URL_S3 at import time; set early.
@@ -299,19 +303,23 @@ class _S3IterableMixin:
         return cache
 
     def _prefetch(self, obj_keys: list) -> dict:
-        """Dispatch to the configured library's prefetch method."""
+        """Dispatch to the configured library's prefetch method and accumulate byte counts."""
         lib = self._storage_library
         if lib == "s3dlio":
-            return self._prefetch_s3dlio(obj_keys)
+            cache = self._prefetch_s3dlio(obj_keys)
         elif lib == "s3torchconnector":
-            return self._prefetch_s3torchconnector(obj_keys)
+            cache = self._prefetch_s3torchconnector(obj_keys)
         elif lib == "minio":
-            return self._prefetch_minio(obj_keys)
+            cache = self._prefetch_minio(obj_keys)
         else:
             raise ValueError(
                 f"{self.__class__.__name__}: unknown storage_library {lib!r}; "
                 "supported: s3dlio, s3torchconnector, minio"
             )
+        # Accumulate ACTUAL bytes transferred (real sizes, not configured estimates).
+        self._total_bytes_read += sum(cache.values())
+        self._total_objects_read += len(cache)
+        return cache
 
     # ── FormatReader lifecycle helpers ────────────────────────────────────────
 
@@ -342,3 +350,29 @@ class _S3IterableMixin:
         """Fetch a single object on demand if it is not already in the cache."""
         if filename not in self._object_cache:
             self._object_cache.update(self._prefetch([filename]))
+
+    def finalize_s3_bytes(self) -> None:
+        """
+        Update ``args.record_length`` from the actual bytes transferred this epoch.
+
+        Must be called from each reader's ``finalize()`` BEFORE resetting epoch
+        state.  Mirrors the same pattern used by ``ParquetReaderS3dlio.finalize()``.
+
+        Uses measured bytes per object (average across all objects fetched this
+        epoch) rather than the configured ``record_length_bytes`` estimate.  For
+        workloads with high file-size variance (e.g. UNet3D stdev ≈ 65 MiB),
+        this gives a more accurate per-epoch I/O throughput figure.
+
+        After updating, resets the epoch counters so the next epoch starts clean.
+        """
+        if self._total_objects_read > 0 and self._total_bytes_read > 0:
+            measured = self._total_bytes_read // self._total_objects_read
+            self._args.record_length = measured
+            self.logger.debug(
+                f"{utcnow()} {self.__class__.__name__} epoch done: "
+                f"actual {self._total_bytes_read / 1024**3:.3f} GiB read, "
+                f"{self._total_objects_read} objects, "
+                f"{measured:,} bytes/object"
+            )
+        self._total_bytes_read = 0
+        self._total_objects_read = 0

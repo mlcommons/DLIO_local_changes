@@ -838,8 +838,12 @@ class ConfigArguments:
         self.record_element_dtype = np.dtype(self.record_element_type)
         self.record_element_bytes = self.record_element_dtype.itemsize
 
-        # hdf5 specific derivations
-        self.record_length = np.prod(self.record_dims) * self.record_element_bytes
+        # hdf5 / record_dims specific derivations — only override record_length when
+        # record_dims is explicitly set. When record_length_bytes is used instead
+        # (e.g. NPZ/NPY/Image workloads with variable-size objects), np.prod([]) = 1
+        # would silently overwrite the correct user-supplied value with 1 byte.
+        if self.record_dims:
+            self.record_length = np.prod(self.record_dims) * self.record_element_bytes
 
         self.transformed_record_element_dtype = np.dtype(self.transformed_record_element_type)
 
