@@ -44,9 +44,7 @@ class NPZReaderIterable(FormatReader, _LocalFSIterableMixin):
         dlp.update(image_size=self._local_cache.get(filename, 0))
 
     def next(self):
-        self._localfs_prefetch_all()
-        for batch in super().next():
-            yield batch
+        yield from self._localfs_stream_next()
 
     @dlp.log
     def read_index(self, image_idx, step):

@@ -47,9 +47,7 @@ class ImageReaderIterable(FormatReader, _LocalFSIterableMixin):
         dft_ai.update(image_size=byte_count)
 
     def next(self):
-        self._localfs_prefetch_all()
-        for batch in super().next():
-            yield batch
+        yield from self._localfs_stream_next()
 
     @dlp.log
     def read_index(self, image_idx, step):

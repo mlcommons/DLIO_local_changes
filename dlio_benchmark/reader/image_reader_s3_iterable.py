@@ -80,9 +80,7 @@ class ImageReaderS3Iterable(FormatReader, _S3IterableMixin):
         dft_ai.update(image_size=byte_count)
 
     def next(self):
-        self._s3_prefetch_all()
-        for batch in super().next():
-            yield batch
+        yield from self._s3_stream_next()
 
     @dlp.log
     def read_index(self, image_idx, step):

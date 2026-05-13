@@ -87,9 +87,7 @@ class NPYReaderS3Iterable(FormatReader, _S3IterableMixin):
         dlp.update(image_size=self._object_cache.get(filename, 0))
 
     def next(self):
-        self._s3_prefetch_all()
-        for batch in super().next():
-            yield batch
+        yield from self._s3_stream_next()
 
     @dlp.log
     def read_index(self, image_idx, step):

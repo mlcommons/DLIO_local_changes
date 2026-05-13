@@ -66,9 +66,12 @@ Subclass from BOTH the format-specific parent AND this mixin::
                 yield batch
 """
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from dlio_benchmark.utils.utility import utcnow
+
+_PREFETCH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="localfs_prefetch")
 
 
 class _LocalFSIterableMixin:
@@ -173,16 +176,128 @@ class _LocalFSIterableMixin:
 
     # ── Dispatcher ────────────────────────────────────────────────────────────
 
+    def _localfs_stream_next(self):
+        """
+        Bounded streaming replacement for the ``_localfs_prefetch_all() + super().next()``
+        bulk-prefetch pattern.
+
+        PROBLEM WITH BULK-PREFETCH (identical to _S3IterableMixin._s3_prefetch_all)
+        ===========================================================================
+        ``_localfs_prefetch_all()`` submitted ALL files for this worker to either
+        ThreadPoolExecutor (buffered) or s3dlio.get_many() (O_DIRECT) before the
+        training loop started.  With many files this causes:
+
+          Buffered   — OS schedules hundreds of concurrent read() syscalls at once;
+                       page-cache lock contention on Linux degrades throughput.
+          O_DIRECT   — s3dlio Tokio runtime receives all io_uring sqe submissions
+                       simultaneously; the kernel io_uring queue depth (typically
+                       32–4096) becomes the bottleneck rather than device bandwidth.
+
+        SOLUTION: CHUNKED STREAMING WINDOW
+        ===================================
+        Files are processed in chunks of ``prefetch_window`` (default 256).
+        Each chunk is read — at most 64 concurrent in-flight reads — then iterated
+        for telemetry and batch assembly, then freed before the next chunk.
+
+        This keeps the kernel I/O queue at a steady, bounded depth throughout the
+        epoch rather than spiking at the start.  The behaviour mirrors
+        ``_S3IterableMixin._s3_stream_next()`` exactly; workload comparisons
+        between S3 and local storage remain apples-to-apples.
+
+        Configure window size via ``storage_options.prefetch_window`` (default 256).
+        Setting it to 64 matches max_in_flight exactly for tightest queue control.
+        """
+        args = self._args
+        batch_size = args.batch_size
+        num_spf = args.num_samples_per_file
+        opts = getattr(args, "storage_options", {}) or {}
+        window = int(opts.get("prefetch_window", 256))
+        dummy = args.resized_image
+        mode = "s3dlio-direct://" if self._use_direct else "buffered"
+
+        thread_entries = self.file_map.get(self.thread_index, [])
+        seen = set()
+        paths = []
+        for _, filename, _ in thread_entries:
+            if filename not in seen:
+                seen.add(filename)
+                paths.append(filename)
+
+        if not paths:
+            return
+
+        # ── Worker stagger ────────────────────────────────────────────────────
+        # Same rationale as _S3IterableMixin._s3_stream_next(): without a
+        # startup delay all workers submit their first chunk simultaneously.
+        # For buffered reads this spikes page-cache lock contention; for
+        # O_DIRECT it floods the io_uring submission queue all at once.
+        # Disable by setting storage_options.stagger_workers: false.
+        if str(opts.get("stagger_workers", "true")).lower() not in ("false", "0", "no"):
+            ct_raw = getattr(args, "computation_time", 0.0)
+            ct = ct_raw.get("mean", 0.0) if isinstance(ct_raw, dict) else float(ct_raw or 0.0)
+            delay = self.thread_index * ct
+            if delay > 0:
+                self.logger.debug(
+                    f"{utcnow()} {self.__class__.__name__} thread={self.thread_index} "
+                    f"stagger delay={delay:.4f}s ({self.thread_index} × {ct:.4f}s)"
+                )
+                time.sleep(delay)
+
+        total = len(paths)
+        n_chunks = (total + window - 1) // window
+        self.logger.info(
+            f"{utcnow()} {self.__class__.__name__} thread={self.thread_index} "
+            f"streaming {total} files in {n_chunks} chunks of {window} [{mode}]"
+        )
+
+        sample_buf = 0
+
+        # ── Pipelined chunk loop ─────────────────────────────────────────────
+        # Same rationale as _S3IterableMixin._s3_stream_next().
+        # The background thread fetches chunk N+1 while the main thread yields
+        # batches from chunk N.  For buffered reads the background thread holds
+        # the GIL only for the open()+read() syscall setup; the kernel I/O
+        # itself is blocking but runs concurrently with Python's yield loop.
+        # For O_DIRECT, s3dlio releases the GIL entirely during Rust io_uring.
+        def _fetch(chunk):
+            if self._use_direct:
+                c = self._prefetch_direct(chunk)
+            else:
+                c = self._prefetch_buffered(chunk)
+            self._total_bytes_read += sum(c.values())
+            self._total_objects_read += len(c)
+            return c
+
+        chunks = [paths[i : i + window] for i in range(0, total, window)]
+
+        future = _PREFETCH_POOL.submit(_fetch, chunks[0])
+
+        for idx, chunk in enumerate(chunks):
+            cache = future.result()
+
+            if idx + 1 < len(chunks):
+                future = _PREFETCH_POOL.submit(_fetch, chunks[idx + 1])
+            else:
+                future = None
+
+            self._local_cache = cache
+            for path in chunk:
+                for s in range(num_spf):
+                    self.get_sample(path, s)   # dlp + dft_ai image_size update
+                    sample_buf += 1
+                    if sample_buf >= batch_size:
+                        yield dummy
+                        sample_buf -= batch_size
+            self._local_cache = {}
+        # Drop-last: remaining sample_buf < batch_size is silently discarded.
+
     def _localfs_prefetch_all(self) -> None:
         """
-        Collect all files assigned to this thread and prefetch them in parallel.
+        Prefetch ALL files for this thread in one shot.
 
-        Routes to the O_DIRECT (s3dlio direct://) or buffered (Python open())
-        path based on the ``storage_library`` setting from _localfs_init().
-
-        Call at the top of ``next()`` before the iteration loop. Deduplicates
-        filenames while preserving order (a multi-sample file may appear many
-        times in the thread's file_map entries).
+        Retained for ``read_index()`` (on-demand map-style access) to warm the
+        cache before random access begins.  The main streaming path uses
+        ``_localfs_stream_next()`` instead to avoid thundering-herd I/O.
         """
         thread_entries = self.file_map.get(self.thread_index, [])
         seen = set()
