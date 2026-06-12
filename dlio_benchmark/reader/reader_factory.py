@@ -158,6 +158,9 @@ class ReaderFactory(object):
             else:
                 from dlio_benchmark.reader.parquet_reader import ParquetReader
                 return ParquetReader(dataset_type, thread_index, epoch_number)
+        elif type == FormatType.ARROW:
+            from dlio_benchmark.reader.arrow_reader import ArrowReader
+            return ArrowReader(dataset_type, thread_index, epoch_number)
 
 
         else:
