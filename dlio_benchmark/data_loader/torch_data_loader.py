@@ -415,11 +415,20 @@ class dlio_sampler(Sampler):
         self.rank = rank
         self.num_samples = num_samples
         self.epochs = epochs
-        samples_per_proc = int(math.ceil(num_samples/size)) 
+        if num_samples % size != 0:
+            raise ValueError(
+                f"num_samples ({num_samples}) is not divisible by "
+                f"comm_size ({size}). All ranks must get the same "
+                f"number of samples to avoid a deadlock at epoch "
+                f"boundaries (the training loop calls comm.barrier() "
+                f"per batch, and unequal batch counts across ranks "
+                f"cause mismatched collectives). Adjust "
+                f"num_files_train so that num_files_train * "
+                f"num_samples_per_file is a multiple of comm_size."
+            )
+        samples_per_proc = num_samples // size
         start_sample = self.rank * samples_per_proc
         end_sample = (self.rank + 1) * samples_per_proc - 1
-        if end_sample > num_samples - 1:
-            end_sample = num_samples - 1
         self.indices = list(range(start_sample, end_sample + 1))
 
 

@@ -214,38 +214,115 @@ class DLIOBenchmark(object):
         file_list_eval = []
         num_subfolders = 0
         if self.args.do_train:
-            for dataset_type in [DatasetType.TRAIN, DatasetType.VALID]:
-                if dataset_type == DatasetType.TRAIN:
-                    num_subfolders = self.num_subfolders_train
+            if self.args.synthetic_file_list:
+                # Skip the expensive filesystem walk: synthesise the path
+                # list deterministically from the same template that
+                # `data_generator.py` writes. Rank 0 probes a handful of
+                # paths to verify the layout actually matches before we
+                # commit to using the synthetic view.
+                from dlio_benchmark.utils.file_index import SyntheticFileList
+                # When reusing an existing dataset, the ``_of_N`` suffix
+                # baked into filenames may not equal num_files_train (e.g.
+                # the user wants to train on a subset). Rank 0 discovers
+                # the true on-disk N from one filename and broadcasts it;
+                # the legacy ">", "<", "==" logic below then truncates as
+                # needed. During generate-only runs the dataset doesn't
+                # exist yet, so we trust num_files_train.
+                if self.generate_only:
+                    on_disk_total_train = self.num_files_train
+                    on_disk_total_eval = self.num_files_eval
                 else:
-                    num_subfolders = self.num_subfolders_eval
-                walk_path = os.path.join(self.args.data_folder, f"{dataset_type}")
-                filenames = self.storage.walk_node(walk_path)
-                self.logger.debug(f"filenames {filenames} {num_subfolders}")
-                if (len(filenames) == 0):
-                    continue
-                check_path = os.path.join(self.args.data_folder, f"{dataset_type}", filenames[0])
-                if self.storage.get_node(
-                        check_path) == MetadataType.DIRECTORY:
-                    assert (num_subfolders == len(filenames))
-                    fullpaths = self.storage.walk_node(
-                        os.path.join(self.args.data_folder, f"{dataset_type}/*/*.{self.args.format}"),
-                        use_pattern=True)
-                    files = [self.storage.get_basename(f) for f in fullpaths]
-                    idx = np.argsort(files)
-                    fullpaths = [fullpaths[i] for i in idx]
-                    self.logger.debug(f"fullpaths {fullpaths}")
-                else:
-                    assert (num_subfolders == 0)
-                    fullpaths = [self.storage.get_uri(os.path.join(self.args.data_folder, f"{dataset_type}", entry))
-                                for entry in filenames if entry.endswith(f'{self.args.format}')]
-                    fullpaths = sorted(fullpaths)
-                    self.logger.debug(f"fullpaths {fullpaths}")
-                self.logger.debug(f"subfolder {num_subfolders} fullpaths {fullpaths}")
-                if dataset_type is DatasetType.TRAIN:
-                    file_list_train = fullpaths
-                elif dataset_type is DatasetType.VALID:
-                    file_list_eval = fullpaths
+                    if self.args.my_rank == 0:
+                        on_disk_total_train = SyntheticFileList.peek_total_from_disk(
+                            data_folder=self.args.data_folder,
+                            dataset_type=str(DatasetType.TRAIN),
+                            num_subfolders=self.num_subfolders_train,
+                            file_prefix=self.args.file_prefix,
+                            file_format=self.args.format,
+                            expected_total=self.args.num_files_train_on_disk,
+                            storage=self.storage,
+                        )
+                        on_disk_total_eval = (
+                            SyntheticFileList.peek_total_from_disk(
+                                data_folder=self.args.data_folder,
+                                dataset_type=str(DatasetType.VALID),
+                                num_subfolders=self.num_subfolders_eval,
+                                file_prefix=self.args.file_prefix,
+                                file_format=self.args.format,
+                                expected_total=self.args.num_files_eval_on_disk,
+                                storage=self.storage,
+                            ) if self.do_eval else 0
+                        )
+                    else:
+                        on_disk_total_train = None
+                        on_disk_total_eval = None
+                    on_disk_total_train = self.comm.bcast(
+                        on_disk_total_train, root=0)
+                    on_disk_total_eval = self.comm.bcast(
+                        on_disk_total_eval, root=0)
+                file_list_train = SyntheticFileList(
+                    data_folder=self.args.data_folder,
+                    dataset_type=str(DatasetType.TRAIN),
+                    num_files=on_disk_total_train,
+                    num_subfolders=self.num_subfolders_train,
+                    file_prefix=self.args.file_prefix,
+                    file_format=self.args.format,
+                )
+                if self.do_eval:
+                    file_list_eval = SyntheticFileList(
+                        data_folder=self.args.data_folder,
+                        dataset_type=str(DatasetType.VALID),
+                        num_files=on_disk_total_eval,
+                        num_subfolders=self.num_subfolders_eval,
+                        file_prefix=self.args.file_prefix,
+                        file_format=self.args.format,
+                    )
+                if self.args.my_rank == 0 and not self.generate_only:
+                    file_list_train.validate_on_disk(
+                        expected_record_bytes=self.args.record_length,
+                        require_size_match=False,
+                        storage=self.storage,
+                        logger=self.logger)
+                    if self.do_eval:
+                        file_list_eval.validate_on_disk(
+                            expected_record_bytes=self.args.record_length,
+                            require_size_match=False,
+                            storage=self.storage,
+                            logger=self.logger)
+                self.comm.barrier()
+            else:
+                for dataset_type in [DatasetType.TRAIN, DatasetType.VALID]:
+                    if dataset_type == DatasetType.TRAIN:
+                        num_subfolders = self.num_subfolders_train
+                    else:
+                        num_subfolders = self.num_subfolders_eval
+                    walk_path = os.path.join(self.args.data_folder, f"{dataset_type}")
+                    filenames = self.storage.walk_node(walk_path)
+                    self.logger.debug(f"filenames {filenames} {num_subfolders}")
+                    if (len(filenames) == 0):
+                        continue
+                    check_path = os.path.join(self.args.data_folder, f"{dataset_type}", filenames[0])
+                    if self.storage.get_node(
+                            check_path) == MetadataType.DIRECTORY:
+                        assert (num_subfolders == len(filenames))
+                        fullpaths = self.storage.walk_node(
+                            os.path.join(self.args.data_folder, f"{dataset_type}/*/*.{self.args.format}"),
+                            use_pattern=True)
+                        files = [self.storage.get_basename(f) for f in fullpaths]
+                        idx = np.argsort(files)
+                        fullpaths = [fullpaths[i] for i in idx]
+                        self.logger.debug(f"fullpaths {fullpaths}")
+                    else:
+                        assert (num_subfolders == 0)
+                        fullpaths = [self.storage.get_uri(os.path.join(self.args.data_folder, f"{dataset_type}", entry))
+                                    for entry in filenames if entry.endswith(f'{self.args.format}')]
+                        fullpaths = sorted(fullpaths)
+                        self.logger.debug(f"fullpaths {fullpaths}")
+                    self.logger.debug(f"subfolder {num_subfolders} fullpaths {fullpaths}")
+                    if dataset_type is DatasetType.TRAIN:
+                        file_list_train = fullpaths
+                    elif dataset_type is DatasetType.VALID:
+                        file_list_eval = fullpaths
             if not self.generate_only and self.num_files_train > len(file_list_train):
                 raise Exception(
                     "Not enough training dataset is found; Please run the code with ++workload.workflow.generate_data=True")

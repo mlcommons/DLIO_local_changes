@@ -66,17 +66,30 @@ class VirtualIndexMap:
             np.random.seed(shuffle_seed)
             np.random.shuffle(self._sample_list)
 
-        # Pre-resolve absolute paths once (only num_files entries)
+        # Keep a reference to the file list; resolve absolute paths lazily.
+        # Materialising `[os.path.abspath(f) for f in file_list]` for a
+        # large dataset is duplicated into every DataLoader worker on
+        # `spawn`, causing OOM on memory-constrained nodes.
+        # `os.path.abspath` is just `os.getcwd() + os.sep + path` when the path
+        # is relative; we precompute that prefix once and apply it on demand
+        # inside `_resolve`. For absolute paths (the LOCAL_FS case after datagen
+        # writes under an absolute `data_folder`) the prefix never fires.
+        self._file_list = file_list
         if storage_type == StorageType.LOCAL_FS:
-            self._abs_paths = [os.path.abspath(f) for f in file_list]
+            self._abspath_prefix = os.getcwd() + os.sep
         else:
-            self._abs_paths = list(file_list)
+            self._abspath_prefix = ""
 
     def _resolve(self, global_sample_index):
         """Compute (filename, sample_index) from a global sample index."""
         file_index = int(global_sample_index // self._num_samples_per_file)
         sample_index = int(global_sample_index % self._num_samples_per_file)
-        return (self._abs_paths[file_index], sample_index)
+        path = self._file_list[file_index]
+        # `path` may already be absolute (datagen writes under absolute
+        # data_folder); only prepend the cwd prefix when it isn't.
+        if self._abspath_prefix and not path.startswith(os.sep):
+            path = self._abspath_prefix + path
+        return (path, sample_index)
 
     def __getitem__(self, global_sample_index):
         return self._resolve(global_sample_index)
@@ -101,7 +114,7 @@ class VirtualIndexMap:
 
     def __repr__(self):
         return (f"VirtualIndexMap(samples={len(self._sample_list)}, "
-                f"files={len(self._abs_paths)}, "
+                f"files={len(self._file_list)}, "
                 f"samples_per_file={self._num_samples_per_file})")
 
 
@@ -209,6 +222,21 @@ class ConfigArguments:
     data_loader: DataLoaderType = DataLoaderType.TENSORFLOW.value
     num_subfolders_train: int = 0
     num_subfolders_eval: int = 0
+    # When True, replace the eager filesystem walk in main.py with a
+    # `SyntheticFileList` that formats paths on demand from the same
+    # template used by data_generator.py. Saves ~210 bytes per file in
+    # RAM and eliminates the expensive filesystem walk at startup. Only
+    # correct for datasets that were produced by `mlpstorage ... datagen`.
+    # Disable if you have a hand-curated dataset that does not match the
+    # `{prefix}_{i}_of_{N}.{format}` naming convention.
+    synthetic_file_list: bool = False
+    # Optional override for the `_of_N` filename suffix when reusing a
+    # data folder that contains files from multiple datagen runs. Leave
+    # at 0 to auto-discover from one filename (the common case). Set
+    # explicitly to disambiguate when peek_total_from_disk reports
+    # multiple distinct Ns. Ignored when synthetic_file_list=False.
+    num_files_train_on_disk: int = 0
+    num_files_eval_on_disk: int = 0
     iostat_devices: ClassVar[List[str]] = []
     data_loader_classname = None
     checkpoint_mechanism_classname = None
@@ -354,9 +382,60 @@ class ConfigArguments:
         if DFTRACER_ENABLE and dlp_logger:
             dlp_logger.finalize()
 
+    def _detect_local_size(self):
+        """Return the number of MPI ranks sharing this physical node.
+
+        Tries, in order:
+        1. Environment variables set by common MPI implementations / Slurm.
+        2. MPI shared-memory communicator split (if mpi4py is importable).
+        3. Fallback: assume all ranks are on one node (comm_size).
+        """
+        import os
+        for env_var in (
+            "OMPI_COMM_WORLD_LOCAL_SIZE",   # Open MPI
+            "MV2_COMM_WORLD_LOCAL_SIZE",    # MVAPICH2
+            "MPI_LOCALNRANKS",              # Intel MPI
+            "SLURM_NTASKS_PER_NODE",        # Slurm (if set)
+            "PMI_LOCAL_SIZE",               # PMI
+        ):
+            val = os.environ.get(env_var)
+            if val is not None:
+                try:
+                    n = int(val)
+                    if n > 0:
+                        return n
+                except ValueError:
+                    pass
+        # Fallback: try MPI shared-memory split
+        try:
+            from mpi4py import MPI
+            shared_comm = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
+            local = shared_comm.Get_size()
+            shared_comm.Free()
+            if local > 0:
+                return local
+        except Exception:
+            pass
+        return self.comm_size
+
     @dlp.log
     def validate(self):
         """ validate whether the parameters are set correctly"""
+        # Verify that total samples are divisible by comm_size.
+        # An uneven split causes the last rank to produce fewer batches,
+        # which deadlocks the training loop at the epoch boundary
+        # (mismatched comm.barrier counts across ranks).
+        total_samples_train = self.num_samples_per_file * self.num_files_train
+        if total_samples_train > 0 and total_samples_train % self.comm_size != 0:
+            raise Exception(
+                f"Total training samples ({self.num_files_train} files * "
+                f"{self.num_samples_per_file} samples/file = "
+                f"{total_samples_train}) is not divisible by comm_size "
+                f"({self.comm_size}). This would give the last rank fewer "
+                f"samples, causing a deadlock at the epoch boundary. "
+                f"Adjust num_files_train to a multiple of "
+                f"{self.comm_size // math.gcd(self.comm_size, self.num_samples_per_file)}."
+            )
         if (self.do_profiling == True) and (self.profiler == Profiler('darshan')):
             if ('LD_PRELOAD' not in os.environ or os.environ["LD_PRELOAD"].find("libdarshan") == -1):
                 raise Exception("Please set darshan runtime library in LD_PRELOAD")
@@ -386,33 +465,39 @@ class ConfigArguments:
                         f"are insufficient and can lead to lower performance.")
         # Memory budget guard: spawned worker processes must not exhaust system RAM.
         # Each worker loads Python + framework + reader libraries (~512 MB RSS minimum).
-        # The hard cap is 32 GB so these benchmarks run on any compliant system.
-        # This check runs on all ranks so every rank refuses before workers are spawned.
+        # This check uses LOCAL rank count (ranks on this node), not the global
+        # comm_size, because workers are spawned per-rank and only consume RAM
+        # on the node where the rank runs.  Using comm_size here would falsely
+        # reject valid multi-node configurations (see issue:
+        # issue-memory-budget-comm-size.md).
         if self.read_threads > 0 and self.data_loader in [
             DataLoaderType.PYTORCH, DataLoaderType.DALI
         ]:
+            import os
+            import socket
             import psutil
-            total_workers = self.read_threads * self.comm_size
-            # 512 MB per spawned worker is the minimum observed RSS (framework imports only).
+            # Detect how many ranks share this node.
+            local_size = self._detect_local_size()
+            local_workers = self.read_threads * local_size
             per_worker_mb = 512
-            # Use actual installed RAM so large machines aren't blocked (#372).
-            # Spawning more workers than can fit in RAM is still an error.
             BUDGET_MB = psutil.virtual_memory().total // (1024 * 1024)
-            estimated_mb = per_worker_mb * total_workers
+            estimated_mb = per_worker_mb * local_workers
             if estimated_mb > BUDGET_MB:
-                max_threads = BUDGET_MB // per_worker_mb // max(1, self.comm_size)
+                max_threads = BUDGET_MB // per_worker_mb // max(1, local_size)
                 raise Exception(
-                    f"Memory budget exceeded: reader.read_threads={self.read_threads} "
-                    f"x comm_size={self.comm_size} = {total_workers} worker processes, "
-                    f"estimated ~{estimated_mb // 1024} GB (host RAM: {BUDGET_MB // 1024} GB). "
+                    f"Per-node memory budget exceeded on {socket.gethostname()}: "
+                    f"reader.read_threads={self.read_threads} "
+                    f"x local_ranks={local_size} = {local_workers} worker processes, "
+                    f"estimated ~{estimated_mb // 1024} GB "
+                    f"(node RAM: {BUDGET_MB // 1024} GB). "
                     f"Reduce reader.read_threads to at most {max_threads} for this run."
                 )
-            # Also warn if estimated usage exceeds 50% of available RAM on this machine
             available_mb = psutil.virtual_memory().available // (1024 * 1024)
             if estimated_mb > available_mb * 0.5:
                 self.logger.warning(
-                    f"reader.read_threads={self.read_threads} x comm_size={self.comm_size} "
-                    f"= {total_workers} workers, estimated ~{estimated_mb // 1024} GB — "
+                    f"reader.read_threads={self.read_threads} x local_ranks={local_size} "
+                    f"= {local_workers} workers on {socket.gethostname()}, "
+                    f"estimated ~{estimated_mb // 1024} GB — "
                     f"exceeds 50% of available RAM ({available_mb // 1024} GB). "
                     f"Consider reducing read_threads to avoid OOM."
                 )
@@ -934,12 +1019,22 @@ class ConfigArguments:
     def reconfigure(self, epoch_number):
         if self.data_loader_sampler == DataLoaderSampler.ITERATIVE:
             if self.file_shuffle is not Shuffle.OFF:
-                if self.seed_change_epoch:
-                    np.random.seed(self.seed + epoch_number)
-                else:
-                    np.random.seed(self.seed)
-                np.random.shuffle(self.file_list_train) 
-                np.random.shuffle(self.file_list_eval)
+                seed = self.seed + epoch_number if self.seed_change_epoch else self.seed
+                from dlio_benchmark.utils.file_index import shuffle_file_list, SyntheticFileList
+                if isinstance(self.file_list_train, SyntheticFileList):
+                    if epoch_number <= 1:
+                        self.logger.warning(
+                            "file_shuffle is set but the file list is a "
+                            "SyntheticFileList (stateless, shuffle is a no-op). "
+                            "File access order on the ITERATIVE sampler path "
+                            "will be sequential, not randomised. To randomise "
+                            "access order, set sample_shuffle=seed (which "
+                            "shuffles via VirtualIndexMap on the INDEX path), "
+                            "or set synthetic_file_list=False to fall back to "
+                            "a plain list[str] that supports file_shuffle."
+                        )
+                shuffle_file_list(self.file_list_train, seed)
+                shuffle_file_list(self.file_list_eval, seed)
         local_train_sample_sum = 0
         local_eval_sample_sum = 0
         if self.data_loader_sampler == DataLoaderSampler.ITERATIVE:
@@ -999,6 +1094,12 @@ def GetConfig(args, key):
             value = args.num_subfolders_train
         elif keys[1] == "num_subfolders_eval":
             value = args.num_subfolders_eval
+        elif keys[1] == "synthetic_file_list":
+            value = args.synthetic_file_list
+        elif keys[1] == "num_files_train_on_disk":
+            value = args.num_files_train_on_disk
+        elif keys[1] == "num_files_eval_on_disk":
+            value = args.num_files_eval_on_disk
         elif keys[1] == "enable_chunking":
             value = args.enable_chunking
         elif keys[1] == "chunk_size":
@@ -1364,6 +1465,12 @@ def LoadConfig(args, config):
             args.num_subfolders_train = config['dataset']['num_subfolders_train']
         if 'num_subfolders_eval' in config['dataset']:
             args.num_subfolders_eval = config['dataset']['num_subfolders_eval']
+        if 'synthetic_file_list' in config['dataset']:
+            args.synthetic_file_list = bool(config['dataset']['synthetic_file_list'])
+        if 'num_files_train_on_disk' in config['dataset']:
+            args.num_files_train_on_disk = int(config['dataset']['num_files_train_on_disk'])
+        if 'num_files_eval_on_disk' in config['dataset']:
+            args.num_files_eval_on_disk = int(config['dataset']['num_files_eval_on_disk'])
         if 'enable_chunking' in config['dataset']:
             args.enable_chunking = config['dataset']['enable_chunking']
         if 'chunk_size' in config['dataset']:
