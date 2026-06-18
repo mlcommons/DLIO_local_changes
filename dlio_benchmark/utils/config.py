@@ -697,8 +697,24 @@ class ConfigArguments:
             self.num_files_train = len(file_list_train)
             self.total_samples_train = self.num_samples_per_file * len(self.file_list_train)
             self.total_samples_eval = self.num_samples_per_file * len(self.file_list_eval)
-            self.train_sample_index_sum = self.total_samples_train * (self.total_samples_train - 1) // 2
-            self.eval_sample_index_sum = self.total_samples_eval * (self.total_samples_eval - 1) // 2
+
+            # The sampler intentionally drops the trailing remainder when the
+            # total sample count is not divisible by comm_size. Compute the
+            # validation sums from the effective sample counts so reconfigure()
+            # validates exactly the indices that are assigned to ranks.
+            effective_train_samples = (
+                self.total_samples_train // self.comm_size
+            ) * self.comm_size
+            effective_eval_samples = (
+                self.total_samples_eval // self.comm_size
+            ) * self.comm_size
+
+            self.train_sample_index_sum = (
+                effective_train_samples * (effective_train_samples - 1) // 2
+            )
+            self.eval_sample_index_sum = (
+                effective_eval_samples * (effective_eval_samples - 1) // 2
+            )
             self.required_samples = self.comm_size * self.batch_size
             if self.read_threads > 0:
                 self.required_samples *= self.read_threads
