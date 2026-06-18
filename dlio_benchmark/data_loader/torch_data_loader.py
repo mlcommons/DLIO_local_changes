@@ -437,7 +437,13 @@ class dlio_sampler(Sampler):
 
 
     def __len__(self):
-        return self.num_samples
+        # Per-rank shard length — must match what __iter__ yields. Returning
+        # self.num_samples (the global count) here is a pre-existing bug that
+        # the floor-division change above makes provable: len(self.indices) is
+        # now num_samples // size while self.num_samples is still num_samples,
+        # so any caller that builds len(DataLoader) from len(sampler) would
+        # over-report by a factor of comm_size.
+        return len(self.indices)
 
     def __iter__(self):
         for sample in self.indices:
