@@ -105,10 +105,15 @@ class MinIOAdapter:
                 self.buffer = BytesIO()
                 
             def write(self, data):
-                if isinstance(data, bytes):
+                if isinstance(data, (bytes, bytearray, memoryview)):
                     self.buffer.write(data)
                 else:
-                    self.buffer.write(data.encode())
+                    # Handle buffer-protocol objects (e.g. s3dlio BytesView) that
+                    # are not bytes but support the buffer protocol.  bytes() works
+                    # for BytesView, memoryview, bytearray, and any C-extension type
+                    # that implements __buffer__.  Calling .encode() on these fails
+                    # with AttributeError — .encode() is a str-only method.
+                    self.buffer.write(bytes(data))
                     
             def close(self):
                 self.buffer.seek(0)
