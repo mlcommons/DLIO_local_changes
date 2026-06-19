@@ -223,6 +223,14 @@ class ConfigArguments:
     files_pre_sharded: bool = False
     # Number of threads rank 0 uses to list subfolders in parallel.
     listing_threads: int = 4
+    # When True, skip S3/filesystem listing entirely and generate file URIs
+    # deterministically from DLIO's known naming convention:
+    #   {file_prefix}_{index:0N}_of_{num_files}.{format}
+    # Each rank independently computes its own round-robin shard with zero
+    # network calls and zero MPI communication.  Use this for DLIO-generated
+    # datasets where filenames are guaranteed to follow this pattern.
+    # Eliminates multi-hour S3 listing for large datasets (issue #472).
+    skip_listing: bool = False
 
     # derived fields
     required_samples: int = 1

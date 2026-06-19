@@ -239,7 +239,39 @@ class DLIOBenchmark(object):
                         if (start_idx + i) % self.comm_size == self.my_rank:
                             my_files.append(fpath)
 
-                if num_subfolders > 0:
+                if self.args.skip_listing:
+                    # ── Deterministic file list (skip S3 listing entirely) ─
+                    # Generate file URIs from DLIO's naming convention without
+                    # any storage API calls or MPI communication.  Each rank
+                    # independently computes its own round-robin shard.
+                    # Convention: {file_prefix}_{index:0N}_of_{total}.{format}
+                    # For subfoldered layouts: {subfolder}/{file_prefix}_{index:0N}_of_{total}.{format}
+                    # where subfolder = str(index % num_subfolders).zfill(nd_sf)
+                    num_files_expected = (
+                        self.num_files_train if dataset_type is DatasetType.TRAIN
+                        else (self.num_files_eval if self.do_eval else 0)
+                    )
+                    if num_files_expected > 0:
+                        nd_f = len(str(num_files_expected))
+                        nd_sf = len(str(max(num_subfolders - 1, 0))) if num_subfolders > 0 else 0
+                        for idx in range(self.my_rank, num_files_expected, self.comm_size):
+                            fname = f"{self.args.file_prefix}_{str(idx).zfill(nd_f)}_of_{num_files_expected}.{self.args.format}"
+                            if num_subfolders > 0:
+                                sf = str(idx % num_subfolders).zfill(nd_sf)
+                                rel = os.path.join(sf, fname)
+                            else:
+                                rel = fname
+                            uri = self.storage.get_uri(
+                                os.path.join(self.args.data_folder, f"{dataset_type}", rel))
+                            my_files.append(uri)
+                        global_count = num_files_expected
+                    if self.my_rank == 0:
+                        self.logger.output(
+                            f"{utcnow()} skip_listing [{dataset_type}]: generated "
+                            f"{len(my_files)} file URIs deterministically "
+                            f"({global_count} total, no S3 API calls)")
+
+                elif num_subfolders > 0:
                     # ── Subfoldered layout: stream with chunked bcast ─────
                     subfolder_names = None
                     if self.my_rank == 0:
