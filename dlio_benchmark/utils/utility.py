@@ -222,6 +222,20 @@ class DLIOMPI:
 
     def initialize(self):
         from mpi4py import MPI
+        if self.mpi_state == MPIState.CHILD_INITIALIZED:
+            # The main process can end up in CHILD_INITIALIZED when
+            # TorchIterableDatasetSimple.__iter__ calls worker_init(0) directly
+            # in the main thread (num_workers=0 path).  That deserializes
+            # ConfigArguments via pickle.loads → __setstate__ → DLIOMPI.reset()
+            # + set_parent_values(), leaving the singleton in CHILD_INITIALIZED.
+            # If MPI is actually running (MPI.Is_initialized()), we are the
+            # real MPI process — reset to UNINITIALIZED so initialization
+            # proceeds normally below.  If MPI is not running, we truly are
+            # in a child process and must refuse.
+            if MPI.Is_initialized():
+                self.mpi_state = MPIState.UNINITIALIZED
+            else:
+                raise Exception(f"method {self.classname()}.initialize() called in a child process")
         if self.mpi_state == MPIState.UNINITIALIZED:
             # MPI may have already been initialized by dlio_benchmark_test.py
             if not MPI.Is_initialized():

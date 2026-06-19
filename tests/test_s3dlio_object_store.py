@@ -382,6 +382,7 @@ def test_s3dlio_tfrecord_datagen():
             cfg = compose(config_name="config", overrides=base + [
                 "++workload.workflow.generate_data=True",
                 "++workload.workflow.train=False",
+                "++workload.workflow.evaluation=False",  # TFRecord read requires TF, not pytorch
                 "++workload.workflow.checkpoint=False",
             ])
             _run_benchmark(OmegaConf.to_container(cfg["workload"], resolve=True),
