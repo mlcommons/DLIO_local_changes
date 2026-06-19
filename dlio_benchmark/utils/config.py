@@ -380,7 +380,9 @@ class ConfigArguments:
             if ('LD_PRELOAD' not in os.environ or os.environ["LD_PRELOAD"].find("libdarshan") == -1):
                 raise Exception("Please set darshan runtime library in LD_PRELOAD")
         if self.format is FormatType.TFRECORD and (self.data_loader is DataLoaderType.PYTORCH) and (self.do_train or self.do_eval):
-            raise Exception(f"{self.framework} support for tfrecord is not implemented for {self.data_loader}.")
+            # TFRecordReaderS3Iterable handles pytorch+tfrecord via s3dlio (s3:// and file://).
+            if (self.storage_options or {}).get("storage_library") != "s3dlio":
+                raise Exception(f"{self.framework} support for tfrecord is not implemented for {self.data_loader}.")
         if (self.framework == FrameworkType.TENSORFLOW and self.data_loader == DataLoaderType.PYTORCH) or (
                 self.framework == FrameworkType.PYTORCH and self.data_loader == DataLoaderType.TENSORFLOW):
             raise Exception("Imcompatible between framework and data_loader setup.")

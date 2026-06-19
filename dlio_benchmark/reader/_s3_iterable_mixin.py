@@ -103,15 +103,9 @@ class _S3IterableMixin:
         Raises ``ImportError`` immediately if the configured library is not
         installed, rather than deferring failure to the first I/O call.
         """
-        # storage_library is REQUIRED — there is no default.  Every object
-        # storage workload must explicitly declare which library to use.
-        self._storage_library: str = opts.get("storage_library")
-        if self._storage_library is None:
-            raise ValueError(
-                "storage_options['storage_library'] is required for S3 readers. "
-                "Add 'storage_library: <value>' under the 'storage:' section of "
-                "your workload YAML.  Supported values: minio, s3dlio, s3torchconnector."
-            )
+        # Default to s3dlio — consistent with how data is generated.  Users can
+        # override by setting storage_library in storage_options.
+        self._storage_library: str = opts.get("storage_library") or "s3dlio"
         self._opts: dict = opts
         self._object_cache: dict = {}   # obj_key → int (raw byte count only)
         self._minio_client = None       # cached across epochs for TCP keep-alive
