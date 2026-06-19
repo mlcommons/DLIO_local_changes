@@ -346,14 +346,22 @@ class DLIOMPI:
             return MPI.COMM_WORLD.allreduce(num, op=MPI.SUM)
 
     def allreduce_min(self, value):
-        from mpi4py import MPI
         if self.mpi_state == MPIState.UNINITIALIZED:
             raise Exception(f"method {self.classname()}.allreduce_min() called before initializing MPI")
+        # Single-rank or child-process (DataLoader worker): no collective needed.
+        # Child processes can never issue MPI collectives; returning the local
+        # value is correct for single-rank runs and safe for workers.
+        if self.mpi_state == MPIState.CHILD_INITIALIZED or self.mpi_size <= 1:
+            return value
+        from mpi4py import MPI
         return self.comm().allreduce(value, op=MPI.MIN)
 
     def alltoall(self, data):
         if self.mpi_state == MPIState.UNINITIALIZED:
             raise Exception(f"method {self.classname()}.alltoall() called before initializing MPI")
+        # Single-rank or child-process: identity operation.
+        if self.mpi_state == MPIState.CHILD_INITIALIZED or self.mpi_size <= 1:
+            return data
         return self.comm().alltoall(data)
     
     def finalize(self):

@@ -116,6 +116,9 @@ from dlio_benchmark.main import DLIOBenchmark
 # Using a value much shorter than TEST_TIMEOUT_SECONDS (600 s) so a hang is
 # caught quickly rather than after 10 minutes.
 _S3_TEST_TIMEOUT = int(os.environ.get("DLIO_S3_TEST_TIMEOUT", "120"))  # seconds
+# When DLIO_S3_EXTENDED=1, run all supported formats.  Default: npy only
+# (fastest smoke test — verifies the put+get cycle without exhausting time).
+_S3_EXTENDED = os.environ.get("DLIO_S3_EXTENDED", "0") == "1"
 
 comm = MPI.COMM_WORLD
 _config_dir = os.path.dirname(dlio_benchmark.__file__) + "/configs/"
@@ -126,7 +129,10 @@ log = logging.getLogger(__name__)
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _endpoint():
-    return os.environ.get("AWS_ENDPOINT_URL", "https://172.16.1.40:9000")
+    ep = os.environ.get("AWS_ENDPOINT_URL")
+    if not ep:
+        pytest.skip("AWS_ENDPOINT_URL not set — cannot run live S3 tests")
+    return ep
 
 
 def _region():
