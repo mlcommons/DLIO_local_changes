@@ -231,6 +231,11 @@ class ConfigArguments:
     # datasets where filenames are guaranteed to follow this pattern.
     # Eliminates multi-hour S3 listing for large datasets (issue #472).
     skip_listing: bool = False
+    # When skip_listing=True, rank 0 verifies that a sample of the generated
+    # file URIs actually exist in storage before training begins.
+    # The first file, last file, and every N-th file are checked via HEAD
+    # (s3dlio.exists() / os.path.isfile()).  Set to 0 to disable validation.
+    listing_validation_interval: int = 1000
 
     # derived fields
     required_samples: int = 1
