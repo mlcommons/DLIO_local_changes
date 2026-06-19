@@ -415,8 +415,12 @@ class dlio_sampler(Sampler):
         self.rank = rank
         self.num_samples = num_samples
         self.epochs = epochs
-        args = ConfigArguments.get_instance()
-        if args.files_pre_sharded:
+        try:
+            pre_sharded = ConfigArguments.get_instance().files_pre_sharded
+        except Exception:
+            # MPI not initialized (e.g. unit tests) — treat as non-pre-sharded.
+            pre_sharded = False
+        if pre_sharded:
             # Files already distributed — this rank owns all its local samples.
             # Round-robin gives even counts, but allreduce_min as safety net.
             aligned = DLIOMPI.get_instance().allreduce_min(num_samples)
