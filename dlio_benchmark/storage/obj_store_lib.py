@@ -390,6 +390,82 @@ class ObjStoreLibStorage(S3Storage):
                 f"Supported: s3dlio, s3torchconnector, minio"
             )
 
+        # Preflight: verify the configured bucket is reachable + accessible
+        # synchronously here, BEFORE any worker pool starts. Without this,
+        # the first connection failure happens inside an upload thread where
+        # it is buffered into a Future until the f.result() drain loop at
+        # end-of-job (mlcommons/storage#504). The accompanying datagen
+        # fast-fail (DLIO PR #31) prevents the OOM that follows; this check
+        # gives the operator a clear, actionable error message naming the
+        # bucket, library, and resolved endpoint — so misconfigurations are
+        # obvious instead of buried under a backend stack trace.
+        self._preflight_bucket_reachable()
+
+    @dlp.log
+    def _preflight_bucket_reachable(self):
+        """Verify the configured bucket is reachable + accessible (#504).
+
+        Uses the lightest available bucket-probe per library so preflight
+        latency stays low. Any exception during probe is re-raised wrapped
+        with a clear "could not reach <bucket> via <library> at <endpoint>"
+        prefix, so the operator can see exactly which configuration
+        combination failed without parsing a backend stack trace.
+
+        Per-library probe:
+          minio:            client.bucket_exists(bucket) — HEAD bucket
+          s3torchconnector: list_objects(bucket) iterator drained once,
+                            which forces the lazy S3Client to actually
+                            connect (otherwise construction is no-op and
+                            the first network call happens during upload)
+          s3dlio:           s3dlio.exists(<sentinel-key-in-bucket>) — HEAD
+                            request; return value is irrelevant, we only
+                            care whether the call raises
+        """
+        bucket = self.namespace.name
+        endpoint_str = self.endpoint or "<library default; likely AWS S3>"
+
+        try:
+            if self.storage_library == "minio":
+                # MinIOAdapter wraps the underlying Minio client.
+                # bucket_exists returns True/False, raises on auth/network.
+                self.s3_client.client.bucket_exists(bucket)
+
+            elif self.storage_library == "s3torchconnector":
+                # S3Client.list_objects is the lazy entry point. Drain one
+                # element to force the underlying client to actually issue
+                # a network call.
+                _result = self.s3_client.list_objects(bucket, "")
+                for _page in _result:
+                    break
+
+            elif self.storage_library == "s3dlio":
+                # s3dlio.exists() is a HEAD request. The probe key is
+                # extremely unlikely to exist; we don't care about the
+                # return value, only that the call doesn't raise — that
+                # confirms the endpoint and credentials reach this bucket.
+                probe_uri = (
+                    f"{self.uri_scheme}://{bucket}/"
+                    f"__dlio_obj_store_preflight_sentinel__"
+                )
+                self._s3dlio.exists(probe_uri)
+
+            # Unknown storage_library is rejected at __init__ time, so we
+            # never reach this point with an unrecognized value.
+
+        except BaseException as exc:
+            raise RuntimeError(
+                f"Object-storage preflight failed: cannot reach bucket "
+                f"{bucket!r} via library={self.storage_library!r} at "
+                f"endpoint={endpoint_str!r}. Check that the bucket exists, "
+                f"your credentials are valid, and the endpoint is reachable. "
+                f"Underlying error: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        logging.info(
+            f"ObjStoreLibStorage preflight passed: bucket={bucket!r}, "
+            f"library={self.storage_library!r}, endpoint={endpoint_str!r}"
+        )
+
     @dlp.log
     def get_uri(self, id):
         """
