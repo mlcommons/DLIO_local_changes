@@ -55,16 +55,25 @@ class TestDirectSchemeHappyPath:
 
 class TestDirectSchemeMissingDir:
     def test_raises_valueerror_when_dir_missing(self, tmp_path):
-        missing = str(tmp_path / "nonexistent_subdir")
+        # Two levels deep — parent also missing, so makedirs cannot auto-create.
+        missing = str(tmp_path / "nonexistent_parent" / "nonexistent_child")
         obj = _make_storage('direct', missing)
         with pytest.raises(ValueError, match="does not exist or is not a directory"):
             obj._preflight()
 
     def test_raises_valueerror_for_file_scheme_missing_dir(self, tmp_path):
-        missing = str(tmp_path / "ghost")
+        missing = str(tmp_path / "no_parent" / "ghost")
         obj = _make_storage('file', missing)
         with pytest.raises(ValueError, match="does not exist or is not a directory"):
             obj._preflight()
+
+    def test_creates_missing_dir_when_parent_exists(self, tmp_path):
+        """Preflight auto-creates missing checkpoint subdirectory if parent is writable."""
+        new_subdir = str(tmp_path / "checkpoint_subdir")
+        assert not os.path.exists(new_subdir)
+        obj = _make_storage('direct', new_subdir)
+        obj._preflight()  # should not raise
+        assert os.path.isdir(new_subdir)
 
 
 # ---------------------------------------------------------------------------

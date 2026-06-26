@@ -618,13 +618,14 @@ class TorchDataLoader(BaseDataLoader):
                 StorageType.LOCAL_FS,
             )
         )
-        _s3_types = (StorageType.S3, StorageType.AISTORE)
+        _s3_types = (StorageType.S3, StorageType.AISTORE, StorageType.DIRECT_FS)
         # TorchIterableDatasetSimple uses DataLoader(num_workers>0) which forks
         # worker processes via os.fork(). On LOCAL_FS, this fork-after-module-import
         # pattern causes a ThreadPoolExecutor deadlock (the executor's background
         # thread is not fork-safe). Restrict the iterable path to object storage
-        # (S3/AISTORE) only where the prefetch benefit is most significant and
-        # the fork issue does not apply. LOCAL_FS falls through to map-style TorchDataset.
+        # (S3/AISTORE) and direct_fs (s3dlio O_DIRECT) only — the fork issue does
+        # not apply because s3dlio uses a Rust async runtime, not Python threads.
+        # LOCAL_FS falls through to map-style TorchDataset.
         use_simple_iterable_dataset = (
             self.format_type in _simple_iterable_formats
             and not use_rg_iterable_dataset

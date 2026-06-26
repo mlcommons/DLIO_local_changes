@@ -499,9 +499,40 @@ class ConfigArguments:
                     "Install it with: pip install aistore"
                 )
 
+        # direct_fs checks — O_DIRECT local filesystem I/O via s3dlio.
+        # storage_type=direct_fs means "local filesystem via s3dlio direct:// URI".
+        # It is mutually exclusive with storage_type=s3; no S3 credentials required.
+        if self.storage_type == StorageType.DIRECT_FS:
+            storage_library = (self.storage_options or {}).get("storage_library")
+            if storage_library != "s3dlio":
+                raise Exception(
+                    "storage_type=direct_fs requires storage_options.storage_library=s3dlio. "
+                    "Only s3dlio supports O_DIRECT local filesystem I/O via the direct:// URI "
+                    "scheme.  Pass: storage.storage_options.storage_library=s3dlio"
+                )
+            try:
+                import s3dlio  # noqa: F401
+            except ImportError:
+                raise Exception(
+                    "storage_type=direct_fs requires the s3dlio package. "
+                    "Install with: pip install s3dlio"
+                )
+
         # S3 specific checks — all branches are storage_library-aware.
-        # storage_type=s3 means "object storage"; storage_library selects which
+        # storage_type=s3 means "S3 object storage"; storage_library selects which
         # SDK to use (minio, s3dlio, or s3torchconnector).  Do NOT conflate them.
+        # storage_type=s3 always uses an S3 bucket — never a local filesystem path.
+        if self.storage_type == StorageType.S3:
+            storage_root = getattr(self, 'storage_root', None) or ''
+            if storage_root.startswith('/') or storage_root.startswith('file://'):
+                raise Exception(
+                    f"storage_type=s3 is incompatible with a local filesystem path in "
+                    f"storage_root: {storage_root!r}.  "
+                    "storage_type=s3 always refers to an S3 bucket, never a local path.  "
+                    "Use --o-direct (storage_type=direct_fs) for O_DIRECT local I/O via "
+                    "s3dlio, or --file (storage_type=local_fs) for standard POSIX I/O."
+                )
+
         if self.storage_type == StorageType.S3 and self.framework == FrameworkType.PYTORCH:
             # storage_library is REQUIRED — there is no default.  Every object
             # storage workload must explicitly declare which library to use.
@@ -870,10 +901,10 @@ class ConfigArguments:
             _cpu_count = os.cpu_count() or 1
             _ranks_per_node = DLIOMPI.get_instance().ranks_per_node()
             _per_rank_cpu = max(1, _cpu_count // max(1, _ranks_per_node))
-            if self.storage_type == StorageType.S3:
+            if self.storage_type in (StorageType.S3, StorageType.DIRECT_FS):
                 # I/O-bound: 2× per-rank CPUs, floor 8, bounded by cap.
-                # Floor of 8 ensures adequate concurrency for small objects
-                # (JPEG/PNG) where per-request latency dominates throughput.
+                # Both S3 (network I/O) and direct_fs (NVMe O_DIRECT via s3dlio)
+                # benefit from high concurrency: threads block on I/O, not CPU.
                 _auto_w_threads = max(8, min(_per_rank_cpu * 2, _MAX_AUTO_WRITE_THREADS))
             else:
                 # CPU-bound (local FS): scale with available cores per rank.
