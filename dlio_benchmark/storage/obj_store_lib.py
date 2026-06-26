@@ -427,12 +427,22 @@ class ObjStoreLibStorage(S3Storage):
         # Local-filesystem URI schemes use the bucket as a filesystem path.
         # Skip S3 credential / endpoint checks and instead verify that the
         # directory exists and is readable+writable by the current process.
+        # Checkpoint directories (bucket includes the model subdirectory) may
+        # not exist yet on the first run — create them if the parent is accessible.
         if self.uri_scheme in ('direct', 'file'):
+            if not os.path.isdir(bucket):
+                parent = os.path.dirname(bucket.rstrip('/'))
+                if parent and os.path.isdir(parent) and os.access(parent, os.W_OK):
+                    try:
+                        os.makedirs(bucket, exist_ok=True)
+                    except OSError:
+                        pass
             if not os.path.isdir(bucket):
                 raise ValueError(
                     f"ObjStoreLibStorage preflight failed: "
                     f"storage root {bucket!r} does not exist or is not a directory.  "
-                    f"Create the directory before running with --o-direct."
+                    f"Create the directory before running with --o-direct, "
+                    f"or ensure its parent directory is writable."
                 )
             if not os.access(bucket, os.R_OK | os.W_OK):
                 raise ValueError(

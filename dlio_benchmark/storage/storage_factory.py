@@ -32,8 +32,15 @@ class StorageFactory(object):
 
     @staticmethod
     def get_storage(storage_type, namespace, framework=None):
-        if storage_type == StorageType.LOCAL_FS or storage_type == StorageType.DIRECT_FS:
+        if storage_type == StorageType.LOCAL_FS:
             return FileStorage(namespace, framework)
+        elif storage_type == StorageType.DIRECT_FS:
+            # O_DIRECT local filesystem I/O via s3dlio's direct:// URI scheme.
+            # Uses ObjStoreLibStorage so s3dlio handles all reads/writes with
+            # O_DIRECT flags — bypasses the OS page cache entirely.
+            # No S3 credentials required; storage_root is a local directory path.
+            from dlio_benchmark.storage.obj_store_lib import ObjStoreLibStorage
+            return ObjStoreLibStorage(namespace, framework)
         elif storage_type == StorageType.AISTORE:
             # Native AIStore storage using official Python SDK
             if not AISTORE_AVAILABLE:
