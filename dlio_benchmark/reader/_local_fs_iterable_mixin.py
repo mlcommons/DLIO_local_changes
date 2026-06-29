@@ -29,11 +29,11 @@ is pure CPU overhead that has nothing to do with storage bandwidth.
 
 TWO PREFETCH MODES
 ==================
-storage_library: <unset or "posix">
+Buffered (default — neither uri_scheme nor storage_library selects direct)
     ThreadPoolExecutor(64) + Python open() + buffered read.
     Simple, portable, uses OS page cache.
 
-storage_library: "direct"
+O_DIRECT (uri_scheme: "direct"  OR  storage_library: "direct")
     s3dlio.get_many() with direct:// URIs.
     Uses O_DIRECT (Linux) — bypasses page cache entirely, 4 KiB-aligned I/O
     via Tokio async tasks in the s3dlio Rust runtime. GIL is released for the
@@ -41,6 +41,11 @@ storage_library: "direct"
     **Required for accurate NVMe benchmarking** — repeated buffered reads hit
     the page cache rather than the device, understating storage latency and
     saturating DRAM bandwidth instead of device bandwidth.
+
+    Either knob triggers this path. ``uri_scheme: "direct"`` is the canonical
+    signal (matches ``storage_type=direct_fs`` validation, which requires
+    ``storage_library=s3dlio``); ``storage_library: "direct"`` is the legacy
+    single-knob form, kept for backward compatibility. See storage#567.
 
 USAGE PATTERN
 =============
@@ -82,18 +87,31 @@ class _LocalFSIterableMixin:
     call ``_localfs_init()`` from the subclass ``__init__`` after
     ``super().__init__()``.
 
-    Set ``storage_library: direct`` in storage_options to use s3dlio's O_DIRECT
-    path (bypasses page cache — essential for accurate NVMe benchmarking).
-    Default (no storage_library, or ``posix``) uses buffered Python open().
+    The O_DIRECT path (s3dlio with ``direct://`` URIs — bypasses page cache,
+    essential for accurate NVMe benchmarking) is selected when EITHER:
+
+      - ``storage_options.uri_scheme == "direct"`` — the canonical signal,
+        matching how ``storage_type=direct_fs`` is configured upstream
+        (mlcommons/storage's ``--o-direct`` sets uri_scheme=direct and
+        storage_library=s3dlio per ``utils/config.py`` direct_fs validation).
+      - ``storage_options.storage_library == "direct"`` — the legacy
+        single-knob form, kept for backward compatibility.
+
+    Anything else falls back to buffered Python ``open()``.
     """
 
     def _localfs_init(self) -> None:
         """
         Initialise mixin state.
 
-        Reads ``storage_options.storage_library`` from ConfigArguments:
-          - ``"direct"`` → s3dlio O_DIRECT path (``direct://`` URIs, Tokio, GIL-free)
-          - anything else → buffered Python ThreadPoolExecutor path
+        Selects the O_DIRECT prefetch path when EITHER
+        ``storage_options.uri_scheme == "direct"`` OR
+        ``storage_options.storage_library == "direct"``. The uri_scheme
+        gate exists so configs produced by ``storage_type=direct_fs``
+        (which validates ``storage_library=s3dlio``, NOT ``direct``)
+        still reach the s3dlio O_DIRECT engine. Without it, those configs
+        hand ``direct://...`` URIs to plain ``open()`` and crash with
+        FileNotFoundError — see mlcommons/storage#567.
 
         Sets:
           - ``self._local_cache``      (dict: filename → int byte count)
@@ -108,14 +126,16 @@ class _LocalFSIterableMixin:
 
         opts = getattr(self._args, "storage_options", {}) or {}
         lib = opts.get("storage_library", "")
-        self._use_direct: bool = (lib == "direct")
+        scheme = opts.get("uri_scheme", "")
+        self._use_direct: bool = (scheme == "direct") or (lib == "direct")
 
         if self._use_direct:
             try:
                 import s3dlio as _s3dlio  # noqa: F401
             except ImportError as exc:
                 raise ImportError(
-                    f"{self.__class__.__name__}: storage_library='direct' requires "
+                    f"{self.__class__.__name__}: O_DIRECT mode "
+                    f"(uri_scheme='direct' or storage_library='direct') requires "
                     "the s3dlio package. Install with: pip install s3dlio"
                 ) from exc
 
