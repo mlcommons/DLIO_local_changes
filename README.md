@@ -27,11 +27,13 @@
 - **Multi-endpoint load balancing** — `S3_ENDPOINT_URIS` distributes datagen write load across multiple S3 servers, one endpoint per MPI rank (round-robin). Eliminates single-node bottlenecks for large-scale data generation.
 - **Storage env-var overrides** — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL`, `AWS_REGION`, `DLIO_BUCKET`, `DLIO_STORAGE_TYPE`, and `DLIO_STORAGE_LIBRARY` are all read automatically; no YAML changes needed for credential injection.
 - **Post-generation settle guard** — configurable `post_generation_settle_seconds` for eventual-consistency object stores that need time to propagate written objects before training reads begin.
+- **Write integrity: multipart upload retry** (mlcommons/storage#593) — `put_data()` now routes large objects through `_mpu_upload_with_retry()`: on `RuntimeError` the in-progress upload is aborted and a fresh `MultipartUploadWriter` is created, up to `S3DLIO_MPU_MAX_RETRIES` attempts (default 3) with `S3DLIO_MPU_RETRY_DELAY_S` seconds between retries (default 5).  Objects below `S3DLIO_MULTIPART_THRESHOLD_MB` MiB (default 16) use `put_bytes()`, which now has its own Rust-layer HEAD verification and retry (`S3DLIO_PUT_MAX_RETRIES`, `S3DLIO_PUT_RETRY_DELAY_MS`).  Silent data corruption on multi-node AIStore clusters is eliminated.
 
 ### Correctness Fixes
 - **DLRM OOM fix** — replaced the materialized 168 M-entry index dict with a constant-memory `VirtualIndexMap`, eliminating the SIGKILL that occurred on configurations with large datasets.
 - **MPI topology auto-sizing** — `read_threads` now divides by `ranks_per_node()` instead of total `comm_size`, giving correct per-node thread counts on multi-node runs.
 - **StatsCounter metrics** — fixed three bugs: negative throughput from a magic `(len - 2)` constant, unguarded division when the metric window is empty, and a dict-stomping bug in `batch_processed` that silently corrupted per-block data.
+- **Silent multipart corruption** (mlcommons/storage#593) — `MultipartUploadWriter` previously swallowed `CompleteMultipartUpload` errors and never verified the stored object size.  Fixed in s3dlio ≥ 0.9.104; DLIO now also wraps every multipart call in a retry loop (see Storage Backends bullet above).
 
 ### Testing
 - **112-test suite** — comprehensive `pytest`-based CI covering enumerations, config, all generator formats, parquet reader metadata and caching, StatsCounter metrics accuracy, issue regression guards, MPI smoke tests, and end-to-end smoke tests. The original upstream had no automated test suite.

@@ -15,6 +15,7 @@
    limitations under the License.
 """
 import logging
+import time as _time
 from time import time
 from io import BytesIO
 
@@ -615,10 +616,115 @@ class ObjStoreLibStorage(S3Storage):
     def delete_node(self, id):
         return super().delete_node(self.get_uri(id))
 
-    # Threshold above which s3dlio uses MultipartUploadWriter instead of put_bytes.
-    # minio-py uses 5 MiB; 16 MiB is a good balance for MinIO with large objects.
-    # Override via S3DLIO_MULTIPART_THRESHOLD_MB env var (set before import).
+    # ---------------------------------------------------------------------------
+    # Write path configuration (storage#593 — write integrity and retry)
+    # ---------------------------------------------------------------------------
+    #
+    # S3DLIO_MULTIPART_THRESHOLD_MB  (integer ≥ 0, default 16)
+    #   Object size in MiB above which DLIO uses MultipartUploadWriter instead
+    #   of put_bytes().  MultipartUploadWriter sends multiple concurrent
+    #   UploadPart requests and is faster for large objects on most backends.
+    #   Set to 0 to always use multipart (not recommended for small objects).
+    #   Set to a very large value (e.g. 999999) to force all writes through
+    #   put_bytes() (single-part).
+    #   Must be set before the module is imported (read once at class definition).
     _MULTIPART_THRESHOLD = int(os.environ.get("S3DLIO_MULTIPART_THRESHOLD_MB", "16")) * 1024 * 1024
+
+    # S3DLIO_MPU_MAX_RETRIES  (integer ≥ 1, default 3)
+    #   Total multipart upload attempts before _mpu_upload_with_retry() raises
+    #   RuntimeError.  On each failure writer.abort() is called to free the
+    #   in-progress upload slot on the storage backend, then a fresh
+    #   MultipartUploadWriter is created for the next attempt.
+    #   Set to 1 to disable retry (raise on the first failure).
+    #
+    # S3DLIO_MPU_RETRY_DELAY_S  (float ≥ 0, seconds, default 5)
+    #   Seconds to sleep between multipart retry attempts.  Set to 0 for
+    #   back-to-back retries (useful in unit tests with a local backend).
+    #   Set higher (e.g. 30) when the storage backend needs recovery time.
+    #
+    # Note: these two variables cover ONLY the multipart upload path.  For
+    # single-part PUT (objects below _MULTIPART_THRESHOLD), put_bytes() in the
+    # s3dlio Rust library applies its own retry logic governed by the separate
+    # S3DLIO_PUT_MAX_RETRIES and S3DLIO_PUT_RETRY_DELAY_MS variables.
+    # See docs/Environment_Variables.md — "Data Integrity: Write Verification
+    # and Retry" for the full reference including interaction diagram.
+    _MULTIPART_MAX_RETRIES = int(os.environ.get("S3DLIO_MPU_MAX_RETRIES", "3"))
+    _MULTIPART_RETRY_DELAY_S = float(os.environ.get("S3DLIO_MPU_RETRY_DELAY_S", "5"))
+
+    def _mpu_upload_with_retry(self, uri, data_source):
+        """Upload via MultipartUploadWriter with automatic retry on transient failures.
+
+        Parameters
+        ----------
+        uri : str
+            Full object URI (e.g. ``s3://bucket/key``).  The same URI is reused
+            on every attempt — it is safe to do so because any truncated object
+            from a previous attempt has already been deleted by the library
+            before raising.
+        data_source : callable
+            Zero-argument callable that returns an iterable of byte chunks each
+            time it is called.  Called once per attempt, so it must be
+            re-entrant.  For payloads already in memory use ``lambda: [payload]``
+            — the list is trivially re-constructable across attempts at zero
+            cost (no disk re-read, no re-generation).
+
+        Retry policy
+        ------------
+        Controlled by two class-level constants set from environment variables
+        at import time (see comments above):
+
+        - ``_MULTIPART_MAX_RETRIES`` / ``S3DLIO_MPU_MAX_RETRIES`` (default 3):
+          total attempts before RuntimeError is raised.
+        - ``_MULTIPART_RETRY_DELAY_S`` / ``S3DLIO_MPU_RETRY_DELAY_S`` (default 5 s):
+          sleep between attempts (not applied after the final attempt).
+
+        On each failure:
+          1. ``writer.abort()`` is called to release the in-progress upload slot
+             on the server.  If abort() itself raises, that exception is
+             suppressed so the original upload error is what propagates.
+          2. A warning is logged with the attempt number, URI, and error text.
+          3. After sleeping ``_MULTIPART_RETRY_DELAY_S`` seconds, a fresh
+             ``MultipartUploadWriter`` is created and the upload is retried.
+
+        Raises
+        ------
+        RuntimeError
+            After all ``_MULTIPART_MAX_RETRIES`` attempts are exhausted.  The
+            original exception from the last attempt is chained as ``__cause__``.
+        """
+        last_err = None
+        for attempt in range(1, self._MULTIPART_MAX_RETRIES + 1):
+            writer = self._s3dlio.MultipartUploadWriter.from_uri(uri)
+            try:
+                for chunk in data_source():
+                    writer.write(chunk)
+                writer.close()
+                return  # success
+            except RuntimeError as e:
+                last_err = e
+                # If close() raised, the library already cleaned up the server
+                # side.  If write() raised, the MPU is still in progress; abort
+                # to free the upload slot.
+                try:
+                    writer.abort()
+                except Exception:
+                    pass
+                if attempt < self._MULTIPART_MAX_RETRIES:
+                    logging.warning(
+                        f"put_data: s3dlio multipart upload attempt {attempt}/"
+                        f"{self._MULTIPART_MAX_RETRIES} failed for {uri}: {e} — "
+                        f"retrying in {self._MULTIPART_RETRY_DELAY_S:.0f}s"
+                    )
+                    _time.sleep(self._MULTIPART_RETRY_DELAY_S)
+                else:
+                    logging.error(
+                        f"put_data: s3dlio multipart upload failed after "
+                        f"{self._MULTIPART_MAX_RETRIES} attempts for {uri}: {e}"
+                    )
+        raise RuntimeError(
+            f"Multipart upload to {uri} failed after {self._MULTIPART_MAX_RETRIES} "
+            f"attempts"
+        ) from last_err
 
     @dlp.log
     def put_data(self, id, data, offset=None, length=None):
@@ -636,10 +742,10 @@ class ObjStoreLibStorage(S3Storage):
             if payload_len >= self._MULTIPART_THRESHOLD:
                 # Use MultipartUploadWriter for large objects — sends multiple
                 # concurrent UploadPart requests instead of one giant single-part PUT.
-                # This is why minio-py is faster for 140 MiB NPZ files.
+                # payload is already in memory, so data_source is safely re-callable
+                # across retry attempts (storage#593).
                 logging.debug(f"put_data: s3dlio multipart upload {id} ({payload_len/1024/1024:.1f} MiB, threshold={self._MULTIPART_THRESHOLD//1024//1024} MiB)")
-                with self._s3dlio.MultipartUploadWriter.from_uri(id) as writer:
-                    writer.write(payload)
+                self._mpu_upload_with_retry(id, lambda: [payload])
             else:
                 self._s3dlio.put_bytes(id, payload)
         else:
