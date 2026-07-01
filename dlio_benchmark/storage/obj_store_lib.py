@@ -630,6 +630,37 @@ class ObjStoreLibStorage(S3Storage):
     #   Must be set before the module is imported (read once at class definition).
     _MULTIPART_THRESHOLD = int(os.environ.get("S3DLIO_MULTIPART_THRESHOLD_MB", "16")) * 1024 * 1024
 
+    # --- Write verification (s3dlio >= 0.9.106): OPT-IN, default OFF ---------
+    #
+    # As of s3dlio 0.9.106, HEAD-after-write verification is disabled by
+    # default for BOTH write paths below — a single PUT / single
+    # CompleteMultipartUpload, no extra round-trip, matching the cost of
+    # every other S3 client library.  This is read entirely inside the
+    # s3dlio Rust library; DLIO does not read these two variables itself,
+    # but they directly determine whether the retry constants below ever
+    # have anything to retry:
+    #
+    # S3DLIO_PUT_VERIFY  (bool, default false — s3dlio Rust layer)
+    #   Single-part path (objects below _MULTIPART_THRESHOLD, via put_bytes()).
+    #   When unset/false: one PUT, no HEAD.  When "1"/"true"/"yes"/"on":
+    #   HEAD-verify-retry runs, governed by S3DLIO_PUT_MAX_RETRIES and
+    #   S3DLIO_PUT_RETRY_DELAY_MS (also read inside s3dlio, not by DLIO).
+    #
+    # S3DLIO_MPU_PUT_VERIFY  (bool, default false — s3dlio Rust layer)
+    #   Multipart path (objects at/above _MULTIPART_THRESHOLD).  When
+    #   unset/false: no HEAD after CompleteMultipartUpload, so
+    #   _mpu_upload_with_retry() below only ever retries on a genuine API
+    #   error (e.g. a failed UploadPart) — silent truncation is NOT detected
+    #   and NOT retried.  When "1"/"true"/"yes"/"on": a HEAD confirms the
+    #   stored size and raises RuntimeError on mismatch, which IS caught and
+    #   retried by _mpu_upload_with_retry() below via S3DLIO_MPU_MAX_RETRIES /
+    #   S3DLIO_MPU_RETRY_DELAY_S.
+    #
+    # In other words: enabling S3DLIO_MPU_PUT_VERIFY is what makes the retry
+    # loop below meaningful for storage#593-style silent truncation.  Without
+    # it, _mpu_upload_with_retry() still works correctly, it just never has
+    # a size-mismatch error to retry.
+    #
     # S3DLIO_MPU_MAX_RETRIES  (integer ≥ 1, default 3)
     #   Total multipart upload attempts before _mpu_upload_with_retry() raises
     #   RuntimeError.  On each failure writer.abort() is called to free the
@@ -677,6 +708,15 @@ class ObjStoreLibStorage(S3Storage):
           total attempts before RuntimeError is raised.
         - ``_MULTIPART_RETRY_DELAY_S`` / ``S3DLIO_MPU_RETRY_DELAY_S`` (default 5 s):
           sleep between attempts (not applied after the final attempt).
+
+        This method retries on *any* ``RuntimeError`` from ``write()`` /
+        ``close()`` — including genuine API errors (e.g. a failed
+        ``UploadPart``) regardless of configuration.  Whether a *silent
+        truncation* (storage#593) also raises here depends on
+        ``S3DLIO_MPU_PUT_VERIFY`` (read inside the s3dlio Rust library, not
+        by this method): default ``false`` means truncation is never detected
+        or retried; ``true`` means a post-upload HEAD size check feeds into
+        this same retry loop.
 
         On each failure:
           1. ``writer.abort()`` is called to release the in-progress upload slot
