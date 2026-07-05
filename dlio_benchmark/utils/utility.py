@@ -193,6 +193,46 @@ def utcnow(format=LOG_TS_FORMAT):
     return datetime.now().strftime(format)
 
 
+def _resolve_local_ppn_and_rank(split_comm_size, split_comm_rank, env=None):
+    """Return (local_ppn, mpi_local_rank), applying an OpenMPI fallback.
+
+    storage#671: On Linux kernel 6.8+ with OpenMPI 4.1.6,
+    MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED) can return a sub-
+    communicator whose ``.size`` is 1 on every remote node (i.e. every node
+    other than the one where MPI_Init was called), regardless of the actual
+    per-node process count. Every rank on such a node then believes it is
+    the sole rank on its node, which corrupts DLIO's per-node accounting
+    (``mpi_ppn_list`` length collapses to the total rank count rather than
+    the physical node count) and cascades into wrong ``num_hosts``,
+    ``host_memory_GB``, and ``host_cpu_count`` fields in ``summary.json``.
+
+    When we detect the collapse (``split_size == 1``), fall back to
+    ``OMPI_COMM_WORLD_LOCAL_SIZE`` / ``OMPI_COMM_WORLD_LOCAL_RANK`` — env
+    vars set per-rank by ``mpirun`` / ``mpiexec`` before the process starts,
+    unaffected by the split defect. The fallback is only applied when the
+    env value is strictly greater than 1, so single-rank-per-node runs and
+    non-OpenMPI launchers keep the split result.
+    """
+    if env is None:
+        env = os.environ
+    local_ppn = split_comm_size
+    mpi_local_rank = split_comm_rank
+    if local_ppn <= 1:
+        raw_size = env.get("OMPI_COMM_WORLD_LOCAL_SIZE")
+        if raw_size is not None:
+            try:
+                env_local_size = int(raw_size)
+            except (TypeError, ValueError):
+                env_local_size = 0
+            if env_local_size > 1:
+                local_ppn = env_local_size
+                try:
+                    mpi_local_rank = int(env.get("OMPI_COMM_WORLD_LOCAL_RANK", "0"))
+                except (TypeError, ValueError):
+                    mpi_local_rank = 0
+    return local_ppn, mpi_local_rank
+
+
 # After the DLIOMPI singleton has been instantiated, the next call must be
 # either initialize() if in an MPI process, or set_parent_values() if in a
 # non-MPI pytorch read_threads child process.
@@ -243,11 +283,17 @@ class DLIOMPI:
             
             self.mpi_state = MPIState.MPI_INITIALIZED
             split_comm = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
-            # Number of processes on this node and local rank
-            local_ppn = split_comm.size
-            self.mpi_local_rank = split_comm.rank
-            # Create a communicator of one leader per node
-            if split_comm.rank == 0:
+            # Number of processes on this node and local rank.
+            # storage#671: OpenMPI 4.1.6 on Linux kernel 6.8+ can return
+            # split_comm.size == 1 on remote nodes; fall back to OMPI env
+            # vars when that happens so per-node accounting stays correct.
+            local_ppn, self.mpi_local_rank = _resolve_local_ppn_and_rank(
+                split_comm.size, split_comm.rank,
+            )
+            # Create a communicator of one leader per node — gate on the
+            # (possibly env-corrected) local rank so the fallback actually
+            # reaches leader_comm.allgather (storage#671).
+            if self.mpi_local_rank == 0:
                 leader_comm = MPI.COMM_WORLD.Split(color=0, key=MPI.COMM_WORLD.rank)
                 # Gather each node's process count
                 ppn_list = leader_comm.allgather(local_ppn)

@@ -283,6 +283,71 @@ class TestUtilities:
 
 
 # ===========================================================================
+# 2.5 OpenMPI local-ppn env-var fallback — storage#671 regression
+# ===========================================================================
+class TestOpenMPILocalPPNFallback:
+    """`_resolve_local_ppn_and_rank` must fall back to OMPI env vars when
+    ``MPI.COMM_WORLD.Split_type(COMM_TYPE_SHARED)`` returns size==1 on
+    remote nodes (OpenMPI 4.1.6 + kernel 6.8+ defect — storage#671).
+    """
+
+    def test_helper_exists(self):
+        """`_resolve_local_ppn_and_rank` must be importable from utility."""
+        from dlio_benchmark.utils.utility import _resolve_local_ppn_and_rank
+        assert callable(_resolve_local_ppn_and_rank), (
+            "utility must expose _resolve_local_ppn_and_rank() — storage#671 not implemented"
+        )
+
+    def test_normal_split_ignores_env(self):
+        """When the split reports a plausible size, env vars must not override it."""
+        from dlio_benchmark.utils.utility import _resolve_local_ppn_and_rank
+        env = {"OMPI_COMM_WORLD_LOCAL_SIZE": "3", "OMPI_COMM_WORLD_LOCAL_RANK": "1"}
+        assert _resolve_local_ppn_and_rank(8, 5, env=env) == (8, 5)
+
+    def test_collapsed_split_falls_back_to_env(self):
+        """split_size==1 + env_local_size>1 → use env for both PPN and local rank."""
+        from dlio_benchmark.utils.utility import _resolve_local_ppn_and_rank
+        env = {"OMPI_COMM_WORLD_LOCAL_SIZE": "60", "OMPI_COMM_WORLD_LOCAL_RANK": "42"}
+        assert _resolve_local_ppn_and_rank(1, 0, env=env) == (60, 42)
+
+    def test_collapsed_split_no_env_keeps_split_value(self):
+        """split_size==1 + no env → keep the split values (truly one rank per node)."""
+        from dlio_benchmark.utils.utility import _resolve_local_ppn_and_rank
+        assert _resolve_local_ppn_and_rank(1, 0, env={}) == (1, 0)
+
+    def test_single_process_node_env_matches_split(self):
+        """env_local_size == 1 (true single-rank node) → do not override."""
+        from dlio_benchmark.utils.utility import _resolve_local_ppn_and_rank
+        env = {"OMPI_COMM_WORLD_LOCAL_SIZE": "1", "OMPI_COMM_WORLD_LOCAL_RANK": "0"}
+        assert _resolve_local_ppn_and_rank(1, 0, env=env) == (1, 0)
+
+    def test_malformed_env_local_size_is_safe(self):
+        """Non-integer LOCAL_SIZE must not raise and must not override."""
+        from dlio_benchmark.utils.utility import _resolve_local_ppn_and_rank
+        env = {"OMPI_COMM_WORLD_LOCAL_SIZE": "not-a-number"}
+        assert _resolve_local_ppn_and_rank(1, 0, env=env) == (1, 0)
+
+    def test_malformed_env_local_rank_defaults_zero(self):
+        """Bad LOCAL_RANK env must default to 0, not raise."""
+        from dlio_benchmark.utils.utility import _resolve_local_ppn_and_rank
+        env = {"OMPI_COMM_WORLD_LOCAL_SIZE": "4", "OMPI_COMM_WORLD_LOCAL_RANK": "nope"}
+        assert _resolve_local_ppn_and_rank(1, 0, env=env) == (4, 0)
+
+    def test_leader_gate_uses_mpi_local_rank(self):
+        """DLIOMPI.initialize() must gate the leader Split on self.mpi_local_rank
+        (the env-corrected value), not raw split_comm.rank — otherwise the
+        env fallback never reaches leader_comm.allgather (storage#671).
+        """
+        import inspect
+        from dlio_benchmark.utils.utility import DLIOMPI
+        src = inspect.getsource(DLIOMPI.initialize)
+        assert "self.mpi_local_rank == 0" in src, (
+            "DLIOMPI.initialize() must gate the leader Split on self.mpi_local_rank "
+            "(storage#671) — pre-fix split_comm.rank gate still present"
+        )
+
+
+# ===========================================================================
 # 3. Config — defaults and derive_configurations logic
 # ===========================================================================
 class TestConfigDefaults:
