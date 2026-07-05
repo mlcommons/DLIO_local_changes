@@ -546,9 +546,24 @@ class DLIOBenchmark(object):
         self.stats.start_epoch()
         if self.args.num_checkpoints_write > 0:
             self._checkpoint_write()
-        num_checkpoints_exists = len(self.storage.walk_node(self.args.checkpoint_folder))
+        # storage#667: at scale (e.g. llama3-405b, 512 ranks) all-ranks
+        # walk_node bombards object-storage endpoints with concurrent
+        # recursive LISTs; s3dlio SlowDown/503 is swallowed by
+        # ObjStoreLibStorage.list_objects into [], misread here as "0
+        # checkpoints available" and the read aborts even though the
+        # checkpoints are present. Rank-0 LISTs once and broadcasts the
+        # count. Safe because base_checkpointing.load_checkpoint
+        # reconstructs checkpoint_id deterministically from epoch/step, so
+        # only the count crosses ranks — not the listing itself. Every
+        # other walk_node caller in main.py (lines 384, 395, 435) is
+        # already inside an `if self.my_rank == 0:` block.
+        if self.my_rank == 0:
+            num_checkpoints_exists = len(self.storage.walk_node(self.args.checkpoint_folder))
+        else:
+            num_checkpoints_exists = None
+        num_checkpoints_exists = self.comm.bcast(num_checkpoints_exists, root=0)
         if num_checkpoints_exists < self.args.num_checkpoints_read:
-            raise Exception("Number of checkpoints to be read: {self.args.num_checkpoints_read} is more than the number of checkpoints available: {num_checkpoints_exists}")
+            raise Exception(f"Number of checkpoints to be read: {self.args.num_checkpoints_read} is more than the number of checkpoints available: {num_checkpoints_exists}")
         if self.args.num_checkpoints_read > 0:
             self._checkpoint_read()
         self.stats.end_epoch()
