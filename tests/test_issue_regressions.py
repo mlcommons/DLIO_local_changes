@@ -619,7 +619,10 @@ class TestStorage690_CheckpointReadDoubleBucket:
         """Return a mock that looks like ObjStoreLibStorage."""
         mock_storage = MagicMock()
         mock_storage.uri_scheme = uri_scheme
-        mock_storage.walk_node.return_value = walk_return or ["f1", "f2", "f3"]
+        # `is not None` (not `walk_return or [...]`) so callers can pass
+        # walk_return=[] to simulate zero checkpoints — `[]` is falsy, so
+        # `or` would silently substitute the default 3-item list instead.
+        mock_storage.walk_node.return_value = walk_return if walk_return is not None else ["f1", "f2", "f3"]
         return mock_storage
 
     # -- core regression case -------------------------------------------
@@ -643,11 +646,18 @@ class TestStorage690_CheckpointReadDoubleBucket:
         )
 
     def test_double_bucket_would_produce_zero_and_abort_read(self):
-        """Verify the pre-fix failure mode: double-bucket path → 0 → Exception."""
+        """Confirm the fix avoids the pre-fix failure mode.
+
+        side_effect_old models what walk_node would have received under the
+        OLD code: a bare, unqualified path (which get_uri would double-bucket
+        into 0 results) vs. a scheme-qualified path (correct, non-empty
+        result). This test does NOT exercise the old code or assert an
+        exception — it asserts _checkpoint() does not raise, proving the fix
+        always sends walk_node the scheme-qualified form and the
+        double-bucket branch is never hit.
+        """
         args = self._make_args("my-bucket/ckpt/llama3-8b", num_checkpoints_read=1)
 
-        # Simulate the pre-fix behavior: walk_node gets the bare bucket/prefix
-        # path → get_uri prepends namespace → double-bucket → 0 results.
         def side_effect_old(path):
             if "://" in path:
                 return ["step1/rank0.pt"]   # correct URI → finds checkpoints
@@ -690,6 +700,43 @@ class TestStorage690_CheckpointReadDoubleBucket:
 
         received = mock_storage.walk_node.call_args[0][0]
         assert received == "az://my-container/ckpt/llama3-8b"
+
+    # -- non-regression: s3dlio-backed local schemes (file:// / direct://) --
+    #
+    # Copilot flagged that scheme-qualifying unconditionally for any storage
+    # exposing uri_scheme (not just true object stores) could send walk_node
+    # down the wrong path for uri_scheme="direct"/"file". These two tests
+    # confirm it does not: ObjStoreLibStorage._preflight validates
+    # checkpoint_folder itself as a standalone directory (not nested under
+    # storage_root) for direct/file schemes — the same "checkpoint_folder is
+    # a complete, self-contained location" contract as the s3/az cases above
+    # — so scheme-qualifying it here is correct, not a regression.
+
+    def test_file_scheme_stripped_folder_gets_file_prepended(self):
+        """s3dlio file:// (StorageType.DIRECT_FS backing a local path)."""
+        args = self._make_args("/data/ckpt/llama3-8b")
+        mock_storage = self._make_obj_storage(uri_scheme="file")
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None), \
+             patch.object(type(bench), '_checkpoint_read', lambda self: None):
+            bench._checkpoint()
+
+        received = mock_storage.walk_node.call_args[0][0]
+        assert received == "file:///data/ckpt/llama3-8b"
+
+    def test_direct_scheme_stripped_folder_gets_direct_prepended(self):
+        """s3dlio direct:// (StorageType.DIRECT_FS / --o-direct)."""
+        args = self._make_args("/data/ckpt/llama3-8b")
+        mock_storage = self._make_obj_storage(uri_scheme="direct")
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None), \
+             patch.object(type(bench), '_checkpoint_read', lambda self: None):
+            bench._checkpoint()
+
+        received = mock_storage.walk_node.call_args[0][0]
+        assert received == "direct:///data/ckpt/llama3-8b"
 
     # -- non-regression: local FS ----------------------------------------
 
