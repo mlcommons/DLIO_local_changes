@@ -8,6 +8,8 @@ introducing a runtime dependency on mlpstorage.
 
 import os
 
+from dlio_benchmark.storage.file_storage import _makedirs_race_safe
+
 
 class SimpleStreamingCheckpointing:
     def __init__(self, chunk_size=32 * 1024 * 1024, backend="file", **_kwargs):
@@ -28,7 +30,10 @@ class SimpleStreamingCheckpointing:
         path = self._resolve_path(uri)
         parent = os.path.dirname(path)
         if parent:
-            os.makedirs(parent, exist_ok=True)
+            # storage#699: multiple ranks/hosts write different checkpoint
+            # files under the same step directory concurrently — same
+            # multi-host makedirs race as FileStorage.create_node().
+            _makedirs_race_safe(parent, exist_ok=True)
 
         remaining = int(total_size_bytes)
         with open(path, "wb") as f:

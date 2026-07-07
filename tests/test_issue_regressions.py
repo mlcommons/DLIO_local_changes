@@ -564,6 +564,333 @@ class TestIssue13_SettleGuard:
 
 
 # ===========================================================================
+# storage#699 — os.makedirs(exist_ok=True) race on multi-host checkpoint runs
+# ===========================================================================
+#
+# FileStorage.create_node()/create_namespace() call os.makedirs(path,
+# exist_ok=True). CPython's own exist_ok handling already tolerates races
+# between LOCAL creators sharing one kernel's dentry cache (a FileExistsError
+# -> os.path.isdir() recheck, see cpython os.makedirs). It is NOT reliable
+# across HOSTS on a shared/networked filesystem: a remote host's mkdir() can
+# succeed server-side while THIS host's client still serves a stale negative
+# directory-entry lookup for a brief window, so an *immediate* isdir()
+# recheck can still see "not a directory" and incorrectly re-raise. This
+# surfaced deterministically on an 8-host/64-rank llama3-70b checkpoint run
+# writing to a shared filesystem (storage#699) -- the traceback shows
+# CPython's own recheck had already failed, so simply repeating the same
+# immediate check would not help; the fix retries with backoff so a
+# momentarily-stale client cache has time to converge.
+
+
+class TestStorage699_MakedirsRaceOnSharedFS:
+    """Regression: create_namespace()/create_node() must tolerate a
+    FileExistsError from a concurrent creator whose write has not yet become
+    visible to this process's os.path.isdir() check (storage#699)."""
+
+    # -- the core fix: retry survives a momentarily-stale isdir() ------------
+
+    def test_survives_stale_cache_then_converges(self):
+        """isdir() is False on the first two rechecks (stale client cache),
+        then True (cache caught up) -- must NOT raise, and must have
+        actually slept between attempts (proving the retry path executed,
+        not that it got lucky on attempt 1)."""
+        from dlio_benchmark.storage.file_storage import _makedirs_race_safe
+
+        with patch("dlio_benchmark.storage.file_storage.os.makedirs",
+                   side_effect=FileExistsError(17, "File exists")), \
+             patch("dlio_benchmark.storage.file_storage.os.path.isdir",
+                   side_effect=[False, False, True]) as mock_isdir, \
+             patch("dlio_benchmark.storage.file_storage.sleep") as mock_sleep:
+            _makedirs_race_safe("/shared/ckpt/global_epoch1_step2", exist_ok=True)
+
+        assert mock_isdir.call_count == 3
+        assert mock_sleep.call_count == 2, (
+            "must retry (and sleep between attempts) rather than raise "
+            "immediately after a single failed recheck"
+        )
+
+    def test_no_retry_needed_when_isdir_immediately_true(self):
+        """isdir() is True on the very first recheck: succeed without any
+        sleep — the common case (a true local race CPython already handles,
+        or a fast-converging remote cache) must not be slowed down."""
+        from dlio_benchmark.storage.file_storage import _makedirs_race_safe
+
+        with patch("dlio_benchmark.storage.file_storage.os.makedirs",
+                   side_effect=FileExistsError(17, "File exists")), \
+             patch("dlio_benchmark.storage.file_storage.os.path.isdir",
+                   return_value=True), \
+             patch("dlio_benchmark.storage.file_storage.sleep") as mock_sleep:
+            _makedirs_race_safe("/shared/ckpt/global_epoch1_step2", exist_ok=True)
+
+        assert mock_sleep.call_count == 0
+
+    # -- must still raise for genuine (non-race) failures ---------------
+
+    def test_reraises_if_never_becomes_a_directory(self):
+        """isdir() stays False through every retry (e.g. a stray FILE exists
+        at that path, not a directory another rank created) -- exist_ok=True
+        must not become a blanket error-suppression switch."""
+        from dlio_benchmark.storage.file_storage import (
+            _makedirs_race_safe, _MAKEDIRS_RACE_MAX_ATTEMPTS,
+        )
+
+        with patch("dlio_benchmark.storage.file_storage.os.makedirs",
+                   side_effect=FileExistsError(17, "File exists")), \
+             patch("dlio_benchmark.storage.file_storage.os.path.isdir",
+                   return_value=False) as mock_isdir, \
+             patch("dlio_benchmark.storage.file_storage.sleep"), \
+             pytest.raises(FileExistsError):
+            _makedirs_race_safe("/shared/ckpt/stray-file-path", exist_ok=True)
+
+        assert mock_isdir.call_count == _MAKEDIRS_RACE_MAX_ATTEMPTS + 1, (
+            "must exhaust all retries (plus the final post-loop check) "
+            "before giving up"
+        )
+
+    def test_exist_ok_false_reraises_immediately_without_retry(self):
+        """exist_ok=False must behave exactly like plain os.makedirs — raise
+        immediately, no retry loop, no sleep (the caller explicitly wants an
+        error on any existing path)."""
+        from dlio_benchmark.storage.file_storage import _makedirs_race_safe
+
+        with patch("dlio_benchmark.storage.file_storage.os.makedirs",
+                   side_effect=FileExistsError(17, "File exists")), \
+             patch("dlio_benchmark.storage.file_storage.os.path.isdir") as mock_isdir, \
+             patch("dlio_benchmark.storage.file_storage.sleep") as mock_sleep, \
+             pytest.raises(FileExistsError):
+            _makedirs_race_safe("/shared/ckpt/x", exist_ok=False)
+
+        assert mock_isdir.call_count == 0
+        assert mock_sleep.call_count == 0
+
+    def test_other_os_errors_propagate_unchanged(self):
+        """Only FileExistsError triggers the retry path — a PermissionError
+        (or any other OSError) must propagate immediately, unmodified."""
+        from dlio_benchmark.storage.file_storage import _makedirs_race_safe
+
+        with patch("dlio_benchmark.storage.file_storage.os.makedirs",
+                   side_effect=PermissionError(13, "Permission denied")), \
+             pytest.raises(PermissionError):
+            _makedirs_race_safe("/shared/ckpt/x", exist_ok=True)
+
+    def test_success_path_unaffected(self):
+        """The non-racing case (os.makedirs succeeds outright) must be a
+        pure passthrough — no isdir recheck, no sleep."""
+        from dlio_benchmark.storage.file_storage import _makedirs_race_safe
+
+        with patch("dlio_benchmark.storage.file_storage.os.makedirs") as mock_makedirs, \
+             patch("dlio_benchmark.storage.file_storage.os.path.isdir") as mock_isdir, \
+             patch("dlio_benchmark.storage.file_storage.sleep") as mock_sleep:
+            _makedirs_race_safe("/shared/ckpt/x", exist_ok=True)
+
+        mock_makedirs.assert_called_once_with("/shared/ckpt/x", exist_ok=True)
+        assert mock_isdir.call_count == 0
+        assert mock_sleep.call_count == 0
+
+    # -- wired into both real call sites ---------------------------------
+
+    def test_create_namespace_uses_race_safe_helper(self):
+        """FileStorage.create_namespace must route through the hardened
+        helper, not a bare os.makedirs call."""
+        from dlio_benchmark.storage.file_storage import FileStorage
+
+        fs = FileStorage.__new__(FileStorage)
+        fs.namespace = MagicMock()
+        fs.namespace.name = "/shared/ckpt"
+
+        with patch("dlio_benchmark.storage.file_storage._makedirs_race_safe") as mock_fn:
+            fs.create_namespace(exist_ok=True)
+
+        mock_fn.assert_called_once_with("/shared/ckpt", True)
+
+    def test_create_node_uses_race_safe_helper(self):
+        """FileStorage.create_node must route through the hardened helper,
+        not a bare os.makedirs call."""
+        from dlio_benchmark.storage.file_storage import FileStorage
+
+        fs = FileStorage.__new__(FileStorage)
+        fs.namespace = MagicMock()
+        fs.namespace.name = "/shared/ckpt"
+
+        with patch("dlio_benchmark.storage.file_storage._makedirs_race_safe") as mock_fn:
+            fs.create_node("global_epoch1_step2", exist_ok=True)
+
+        mock_fn.assert_called_once_with("/shared/ckpt/global_epoch1_step2", True)
+
+    # -- real (non-mocked) concurrency stress test ------------------------
+
+    def test_concurrent_create_namespace_real_threads_no_raise(self):
+        """Real FileStorage.create_namespace(), hammered by many threads on
+        the SAME new path concurrently. This exercises the true local
+        thread/process race CPython's own exist_ok already handles — it
+        does not reproduce the networked-filesystem cache-staleness angle
+        (not reproducible without a real multi-host NFS/GPFS mount), but it
+        does prove the wrapper adds no new local-race regression."""
+        from concurrent.futures import ThreadPoolExecutor
+        from dlio_benchmark.storage.file_storage import FileStorage
+
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "shared", "ckpt", "global_epoch1_step2")
+            fs = FileStorage.__new__(FileStorage)
+            fs.namespace = MagicMock()
+            fs.namespace.name = target
+
+            errors = []
+
+            def _create():
+                try:
+                    fs.create_namespace(exist_ok=True)
+                except Exception as e:
+                    errors.append(e)
+
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                list(pool.map(lambda _: _create(), range(64)))
+
+            assert not errors, f"concurrent create_namespace raised: {errors}"
+            assert os.path.isdir(target)
+
+
+# ===========================================================================
+# storage#699 (sibling) — ObjStoreLibStorage._preflight has the identical
+# makedirs race for direct_fs / file-scheme checkpointing
+# ===========================================================================
+#
+# ObjStoreLibStorage._preflight() creates the direct_fs/file-scheme
+# namespace directory with the same "bare os.makedirs, swallow OSError,
+# recheck isdir()" pattern FileStorage had — vulnerable to the identical
+# multi-host/networked-filesystem race. Fixed by routing through the same
+# _makedirs_race_safe() helper as FileStorage, rather than duplicating the
+# retry logic.
+
+
+def _make_preflight_instance(uri_scheme, bucket):
+    """Construct a minimal ObjStoreLibStorage for exercising _preflight()
+    directly, without the full __init__ (credentials/framework machinery
+    that direct/file schemes skip anyway)."""
+    from dlio_benchmark.storage.obj_store_lib import ObjStoreLibStorage
+    from dlio_benchmark.storage.storage_handler import Namespace
+    from dlio_benchmark.common.enumerations import NamespaceType
+
+    inst = ObjStoreLibStorage.__new__(ObjStoreLibStorage)
+    inst.namespace = Namespace(bucket, NamespaceType.FLAT)
+    inst.uri_scheme = uri_scheme
+    return inst
+
+
+class TestStorage699_ObjStoreLibPreflightMakedirsRace:
+    """Regression: ObjStoreLibStorage._preflight()'s direct/file-scheme
+    directory creation must also survive the multi-host makedirs race
+    (storage#699 sibling)."""
+
+    def test_preflight_uses_race_safe_helper(self):
+        """_preflight must route directory creation through
+        _makedirs_race_safe, not a bare os.makedirs call."""
+        from dlio_benchmark.storage.file_storage import (
+            _makedirs_race_safe as real_makedirs_race_safe,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            # _preflight only auto-creates when the bucket's IMMEDIATE parent
+            # already exists (it does not recursively create ancestors) —
+            # so pre-create that parent, not just some higher-up directory.
+            parent_of_bucket = os.path.join(d, "parent", "ckpt")
+            os.makedirs(parent_of_bucket)
+            bucket = os.path.join(parent_of_bucket, "llama3-70b")
+            inst = _make_preflight_instance("file", bucket)
+
+            with patch("dlio_benchmark.storage.obj_store_lib._makedirs_race_safe",
+                       wraps=real_makedirs_race_safe) as mock_fn:
+                inst._preflight()
+
+            mock_fn.assert_called_once_with(bucket, exist_ok=True)
+            assert os.path.isdir(bucket)
+
+    def test_preflight_survives_stale_cache_then_converges(self):
+        """Same race as FileStorage.create_node(): os.makedirs raises
+        FileExistsError, isdir() is False on the first retry-loop recheck
+        (stale client cache) then True — _preflight must not raise."""
+        bucket = "/shared/ckpt/llama3-70b"
+
+        # os.path.isdir() is called for several distinct purposes inside
+        # _preflight + _makedirs_race_safe (does bucket exist? does its
+        # parent exist? the retry-loop recheck; the final recheck). Only the
+        # retry-loop recheck should see the "stale" False — everything else
+        # in this scenario is genuinely True/exists.
+        call_count = {"n": 0}
+
+        def isdir_side_effect(path):
+            call_count["n"] += 1
+            n = call_count["n"]
+            if n == 1:
+                return False   # bucket doesn't exist yet
+            if n == 2:
+                return True    # bucket's parent directory exists
+            if n == 3:
+                return False   # first retry-loop recheck: stale client cache
+            return True        # converged: every later recheck sees it
+
+        with patch("dlio_benchmark.storage.obj_store_lib.os.path.isdir",
+                   side_effect=isdir_side_effect), \
+             patch("dlio_benchmark.storage.obj_store_lib.os.path.dirname",
+                   return_value="/shared/ckpt"), \
+             patch("dlio_benchmark.storage.obj_store_lib.os.access",
+                   return_value=True), \
+             patch("dlio_benchmark.storage.file_storage.os.makedirs",
+                   side_effect=FileExistsError(17, "File exists")), \
+             patch("dlio_benchmark.storage.file_storage.sleep") as mock_sleep:
+            inst = _make_preflight_instance("file", bucket)
+            inst._preflight()  # must not raise
+
+        assert mock_sleep.call_count == 1, (
+            "must have gone through the retry path (one stale recheck, one "
+            "sleep, then converged) rather than raising on the first recheck"
+        )
+
+    def test_direct_scheme_also_covered(self):
+        """The direct:// (O_DIRECT) scheme shares the same code path as
+        file:// — must be covered too, not just file://."""
+        with tempfile.TemporaryDirectory() as d:
+            parent_of_bucket = os.path.join(d, "parent", "ckpt")
+            os.makedirs(parent_of_bucket)
+            bucket = os.path.join(parent_of_bucket, "llama3-70b")
+            inst = _make_preflight_instance("direct", bucket)
+            inst._preflight()  # must not raise
+            assert os.path.isdir(bucket)
+
+
+# ===========================================================================
+# storage#699 (sibling) — SimpleStreamingCheckpointing.save() has the
+# identical makedirs race, in the fallback checkpoint backend used when
+# mlpstorage is not installed
+# ===========================================================================
+
+
+class TestStorage699_SimpleStreamingCheckpointingMakedirsRace:
+    """Regression: the mlpstorage-unavailable fallback checkpoint writer must
+    also survive the multi-host makedirs race (storage#699 sibling) — a run
+    without mlpstorage installed would otherwise hit the exact reported bug
+    unfixed."""
+
+    def test_save_uses_race_safe_helper(self):
+        from dlio_benchmark.checkpointing.simple_streaming_checkpointing import (
+            SimpleStreamingCheckpointing,
+        )
+        from dlio_benchmark.checkpointing import simple_streaming_checkpointing as mod
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ckpt", "global_epoch1_step2", "rank0.bin")
+            ckpt = SimpleStreamingCheckpointing(chunk_size=1024)
+
+            with patch.object(mod, "_makedirs_race_safe",
+                              wraps=mod._makedirs_race_safe) as mock_fn:
+                ckpt.save(path, total_size_bytes=2048)
+
+            mock_fn.assert_called_once_with(os.path.dirname(path), exist_ok=True)
+            assert os.path.isfile(path)
+            assert os.path.getsize(path) == 2048
+
+
+# ===========================================================================
 # storage#690 — checkpoint read double-prepends bucket for object storage
 # ===========================================================================
 

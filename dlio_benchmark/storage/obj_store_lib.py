@@ -22,6 +22,7 @@ from io import BytesIO
 from dlio_benchmark.common.constants import MODULE_STORAGE
 from dlio_benchmark.storage.storage_handler import DataStorage, Namespace
 from dlio_benchmark.storage.s3_storage import S3Storage
+from dlio_benchmark.storage.file_storage import _makedirs_race_safe
 from dlio_benchmark.common.enumerations import NamespaceType, MetadataType
 from urllib.parse import urlparse
 import os
@@ -430,12 +431,21 @@ class ObjStoreLibStorage(S3Storage):
         # directory exists and is readable+writable by the current process.
         # Checkpoint directories (bucket includes the model subdirectory) may
         # not exist yet on the first run — create them if the parent is accessible.
+        #
+        # storage#699: multiple ranks/hosts constructing ObjStoreLibStorage
+        # concurrently (direct_fs / file-scheme checkpointing) can race on
+        # this same directory the same way FileStorage.create_node() did —
+        # use the same race-safe helper (retries the isdir() recheck with
+        # backoff, since a plain os.makedirs(exist_ok=True) is not reliable
+        # across hosts on a networked filesystem). The outer except OSError
+        # is kept as a backstop; the isdir() check below still raises a
+        # clear, descriptive ValueError if the directory truly never appears.
         if self.uri_scheme in ('direct', 'file'):
             if not os.path.isdir(bucket):
                 parent = os.path.dirname(bucket.rstrip('/'))
                 if parent and os.path.isdir(parent) and os.access(parent, os.W_OK):
                     try:
-                        os.makedirs(bucket, exist_ok=True)
+                        _makedirs_race_safe(bucket, exist_ok=True)
                     except OSError:
                         pass
             if not os.path.isdir(bucket):
