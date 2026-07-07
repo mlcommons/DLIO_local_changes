@@ -705,12 +705,15 @@ class TestStorage690_CheckpointReadDoubleBucket:
     #
     # Copilot flagged that scheme-qualifying unconditionally for any storage
     # exposing uri_scheme (not just true object stores) could send walk_node
-    # down the wrong path for uri_scheme="direct"/"file". These two tests
-    # confirm it does not: ObjStoreLibStorage._preflight validates
-    # checkpoint_folder itself as a standalone directory (not nested under
-    # storage_root) for direct/file schemes — the same "checkpoint_folder is
-    # a complete, self-contained location" contract as the s3/az cases above
-    # — so scheme-qualifying it here is correct, not a regression.
+    # down the wrong path for uri_scheme="direct"/"file". The concern is
+    # unfounded: the double-prepend bug applies equally to those schemes.
+    #
+    # For file/direct, namespace.name is a filesystem path (e.g. "/data"),
+    # not a bucket name.  Without the fix, get_uri("/data/ckpt/model") would
+    # produce "file:///data//data/ckpt/model" — the same double-prepend in a
+    # different form.  With the fix, "file:///data/ckpt/model" passes through
+    # get_uri's '://' short-circuit unchanged and walk_node lists the correct
+    # path.  See test_get_uri_double_prepends_bucket_without_scheme for proof.
 
     def test_file_scheme_stripped_folder_gets_file_prepended(self):
         """s3dlio file:// (StorageType.DIRECT_FS backing a local path)."""
@@ -737,6 +740,53 @@ class TestStorage690_CheckpointReadDoubleBucket:
 
         received = mock_storage.walk_node.call_args[0][0]
         assert received == "direct:///data/ckpt/llama3-8b"
+
+    # -- root-cause proof: real get_uri with unqualified path ---------------
+
+    def test_get_uri_double_prepends_bucket_without_scheme(self):
+        """Real ObjStoreLibStorage.get_uri double-prepends the bucket when
+        checkpoint_folder has no scheme — the root cause of storage#690.
+
+        Uses __new__ bypass (same pattern as test_obj_store_preflight.py) to
+        call get_uri without triggering _preflight or importing a storage backend.
+        """
+        from dlio_benchmark.storage.obj_store_lib import ObjStoreLibStorage
+        from types import SimpleNamespace
+
+        inst = ObjStoreLibStorage.__new__(ObjStoreLibStorage)
+        inst.uri_scheme = "s3"
+        inst.namespace = SimpleNamespace(name="my-bucket")
+
+        # Bare path (scheme stripped by storage#583) → double-bucket URI.
+        result = inst.get_uri("my-bucket/ckpt/llama3-8b")
+        assert result == "s3://my-bucket/my-bucket/ckpt/llama3-8b", (
+            "get_uri prepends namespace.name to a bare path, so a path that "
+            "already starts with the bucket gains it a second time."
+        )
+        # Confirm the fix's '://' short-circuit avoids this.
+        result_fixed = inst.get_uri("s3://my-bucket/ckpt/llama3-8b")
+        assert result_fixed == "s3://my-bucket/ckpt/llama3-8b"
+
+    # -- explicit exception: zero available → raises -------------------------
+
+    def test_zero_checkpoints_available_raises(self):
+        """_checkpoint() raises when walk_node returns fewer checkpoints than
+        requested — the exact exception seen in the storage#690 production bug.
+
+        Together with test_get_uri_double_prepends_bucket_without_scheme this
+        proves the full failure chain: bare path → get_uri double-prepends
+        bucket → listing hits wrong prefix → 0 results → this exception fires.
+        """
+        args = self._make_args("s3://my-bucket/ckpt/llama3-8b", num_checkpoints_read=3)
+        mock_storage = self._make_obj_storage(walk_return=[])  # wrong-prefix → empty
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None):
+            with pytest.raises(
+                Exception,
+                match=r"Number of checkpoints to be read: 3 is more than the number of checkpoints available: 0",
+            ):
+                bench._checkpoint()
 
     # -- non-regression: local FS ----------------------------------------
 
