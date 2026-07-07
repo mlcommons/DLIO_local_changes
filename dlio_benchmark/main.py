@@ -558,7 +558,19 @@ class DLIOBenchmark(object):
         # other walk_node caller in main.py (lines 384, 395, 435) is
         # already inside an `if self.my_rank == 0:` block.
         if self.my_rank == 0:
-            num_checkpoints_exists = len(self.storage.walk_node(self.args.checkpoint_folder))
+            # storage#690: mlcommons/storage#583 strips the URI scheme from
+            # checkpoint_folder to avoid ObjStoreLibStorage._preflight's
+            # double-scheme bug, leaving a bare "bucket/prefix/model" path.
+            # self.storage is initialized with storage_root (the bucket) as its
+            # namespace, so get_uri("bucket/prefix/model") prepends the bucket
+            # again → s3://bucket/bucket/prefix/model → list returns 0 objects →
+            # read aborts despite the checkpoints being present.
+            # Fix: reconstruct the scheme so get_uri's '://' short-circuit fires
+            # and the listing targets the correct prefix.
+            ckpt_folder = self.args.checkpoint_folder
+            if '://' not in str(ckpt_folder) and hasattr(self.storage, 'uri_scheme'):
+                ckpt_folder = f"{self.storage.uri_scheme}://{ckpt_folder}"
+            num_checkpoints_exists = len(self.storage.walk_node(ckpt_folder))
         else:
             num_checkpoints_exists = None
         num_checkpoints_exists = self.comm.bcast(num_checkpoints_exists, root=0)
