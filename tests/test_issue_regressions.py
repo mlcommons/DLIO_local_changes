@@ -1,11 +1,12 @@
 """
 TDD tests for remaining DLIO benchmark issues.
 
-Issues covered (PRs #12–#15):
+Issues covered (PRs #12–#15, plus storage#690):
   - Issue 12: MPI topology used for thread auto-sizing  (PR-13)
   - Issues 10+11+6b: Parallel data generation           (PR-14)
   - Issue 9: Storage env-var overrides                  (PR-12)
   - Issue 13: Post-generation settle guard              (PR-15)
+  - storage#690: checkpoint read double-prepends bucket (this PR)
 
 Workflow:
     Write test → run (must FAIL) → implement fix → run (must PASS)
@@ -560,3 +561,247 @@ class TestIssue13_SettleGuard:
             assert not mock_time.sleep.called, (
                 "time.sleep must NOT be called when post_generation_settle_seconds=0.0"
             )
+
+
+# ===========================================================================
+# storage#690 — checkpoint read double-prepends bucket for object storage
+# ===========================================================================
+
+
+def _make_bench_for_checkpoint(args, mock_storage):
+    """Construct a minimal DLIOBenchmark shell for testing _checkpoint()."""
+    from dlio_benchmark.main import DLIOBenchmark
+
+    bench = DLIOBenchmark.__new__(DLIOBenchmark)
+    bench.args = args
+    bench.storage = mock_storage
+    bench.my_rank = 0
+    bench.stats = MagicMock()
+    bench.comm = MagicMock()
+    # Simulate single-rank bcast: just return the value unchanged.
+    bench.comm.bcast.side_effect = lambda val, root: val
+    bench.logger = MagicMock()
+    return bench
+
+
+class TestStorage690_CheckpointReadDoubleBucket:
+    """Regression: _checkpoint() must not double-prepend the bucket when
+    enumerating checkpoints for object storage (storage#690 / this PR).
+
+    Root cause: mlcommons/storage#583 strips the URI scheme from
+    checkpoint_folder before handing it to DLIO, leaving a bare
+    "bucket/prefix/model" path.  self.storage is initialized with
+    storage_root (just the bucket) as its namespace, so
+    get_uri("bucket/prefix/model") prepends the namespace again:
+        s3://bucket/bucket/prefix/model → list returns 0 → read aborts.
+
+    Fix: when checkpoint_folder has no scheme and the storage exposes
+    uri_scheme (object storage), prepend the scheme before walk_node so
+    get_uri's '://' short-circuit fires and the listing uses the right prefix.
+    """
+
+    def setup_method(self):
+        _reset_singletons()
+
+    def teardown_method(self):
+        _reset_singletons()
+
+    def _make_args(self, checkpoint_folder, num_checkpoints_read=2):
+        from dlio_benchmark.utils.config import ConfigArguments
+        _init_mpi()
+        args = ConfigArguments.get_instance()
+        args.checkpoint_folder = checkpoint_folder
+        args.num_checkpoints_write = 0
+        args.num_checkpoints_read = num_checkpoints_read
+        return args
+
+    def _make_obj_storage(self, uri_scheme="s3", walk_return=None):
+        """Return a mock that looks like ObjStoreLibStorage."""
+        mock_storage = MagicMock()
+        mock_storage.uri_scheme = uri_scheme
+        # `is not None` (not `walk_return or [...]`) so callers can pass
+        # walk_return=[] to simulate zero checkpoints — `[]` is falsy, so
+        # `or` would silently substitute the default 3-item list instead.
+        mock_storage.walk_node.return_value = walk_return if walk_return is not None else ["f1", "f2", "f3"]
+        return mock_storage
+
+    # -- core regression case -------------------------------------------
+
+    def test_scheme_stripped_folder_gets_scheme_prepended_before_walk_node(self):
+        """Scheme-stripped checkpoint_folder must gain scheme:// before walk_node."""
+        args = self._make_args("my-bucket/ckpt/llama3-8b")
+        mock_storage = self._make_obj_storage(uri_scheme="s3")
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None), \
+             patch.object(type(bench), '_checkpoint_read', lambda self: None):
+            bench._checkpoint()
+
+        assert mock_storage.walk_node.call_count == 1
+        received = mock_storage.walk_node.call_args[0][0]
+        assert received == "s3://my-bucket/ckpt/llama3-8b", (
+            f"walk_node got {received!r}; expected 's3://my-bucket/ckpt/llama3-8b'. "
+            "Without the scheme, get_uri prepends the namespace (bucket) again → "
+            "s3://my-bucket/my-bucket/ckpt/llama3-8b → list returns 0 (storage#690)."
+        )
+
+    def test_double_bucket_would_produce_zero_and_abort_read(self):
+        """Confirm the fix avoids the pre-fix failure mode.
+
+        side_effect_old models what walk_node would have received under the
+        OLD code: a bare, unqualified path (which get_uri would double-bucket
+        into 0 results) vs. a scheme-qualified path (correct, non-empty
+        result). This test does NOT exercise the old code or assert an
+        exception — it asserts _checkpoint() does not raise, proving the fix
+        always sends walk_node the scheme-qualified form and the
+        double-bucket branch is never hit.
+        """
+        args = self._make_args("my-bucket/ckpt/llama3-8b", num_checkpoints_read=1)
+
+        def side_effect_old(path):
+            if "://" in path:
+                return ["step1/rank0.pt"]   # correct URI → finds checkpoints
+            return []                        # double-bucket URI → nothing
+
+        mock_storage = self._make_obj_storage()
+        mock_storage.walk_node.side_effect = side_effect_old
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None), \
+             patch.object(type(bench), '_checkpoint_read', lambda self: None):
+            # With the fix applied, walk_node receives the scheme-qualified path
+            # → side_effect returns ["step1/rank0.pt"] → check passes, no raise.
+            bench._checkpoint()  # must not raise
+
+    # -- non-regression: already-qualified URIs --------------------------
+
+    def test_already_scheme_qualified_folder_passes_through_unchanged(self):
+        """If checkpoint_folder already has '://', do not prepend scheme again."""
+        args = self._make_args("s3://my-bucket/ckpt/llama3-8b")
+        mock_storage = self._make_obj_storage(uri_scheme="s3")
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None), \
+             patch.object(type(bench), '_checkpoint_read', lambda self: None):
+            bench._checkpoint()
+
+        received = mock_storage.walk_node.call_args[0][0]
+        assert received == "s3://my-bucket/ckpt/llama3-8b"
+
+    def test_az_scheme_stripped_folder_gets_az_prepended(self):
+        """Works for non-S3 object schemes (e.g. az://)."""
+        args = self._make_args("my-container/ckpt/llama3-8b")
+        mock_storage = self._make_obj_storage(uri_scheme="az")
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None), \
+             patch.object(type(bench), '_checkpoint_read', lambda self: None):
+            bench._checkpoint()
+
+        received = mock_storage.walk_node.call_args[0][0]
+        assert received == "az://my-container/ckpt/llama3-8b"
+
+    # -- non-regression: s3dlio-backed local schemes (file:// / direct://) --
+    #
+    # Copilot flagged that scheme-qualifying unconditionally for any storage
+    # exposing uri_scheme (not just true object stores) could send walk_node
+    # down the wrong path for uri_scheme="direct"/"file". The concern is
+    # unfounded: the double-prepend bug applies equally to those schemes.
+    #
+    # For file/direct, namespace.name is a filesystem path (e.g. "/data"),
+    # not a bucket name.  Without the fix, get_uri("/data/ckpt/model") would
+    # produce "file:///data//data/ckpt/model" — the same double-prepend in a
+    # different form.  With the fix, "file:///data/ckpt/model" passes through
+    # get_uri's '://' short-circuit unchanged and walk_node lists the correct
+    # path.  See test_get_uri_double_prepends_bucket_without_scheme for proof.
+
+    def test_file_scheme_stripped_folder_gets_file_prepended(self):
+        """s3dlio file:// (StorageType.DIRECT_FS backing a local path)."""
+        args = self._make_args("/data/ckpt/llama3-8b")
+        mock_storage = self._make_obj_storage(uri_scheme="file")
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None), \
+             patch.object(type(bench), '_checkpoint_read', lambda self: None):
+            bench._checkpoint()
+
+        received = mock_storage.walk_node.call_args[0][0]
+        assert received == "file:///data/ckpt/llama3-8b"
+
+    def test_direct_scheme_stripped_folder_gets_direct_prepended(self):
+        """s3dlio direct:// (StorageType.DIRECT_FS / --o-direct)."""
+        args = self._make_args("/data/ckpt/llama3-8b")
+        mock_storage = self._make_obj_storage(uri_scheme="direct")
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None), \
+             patch.object(type(bench), '_checkpoint_read', lambda self: None):
+            bench._checkpoint()
+
+        received = mock_storage.walk_node.call_args[0][0]
+        assert received == "direct:///data/ckpt/llama3-8b"
+
+    # -- root-cause proof: real get_uri with unqualified path ---------------
+
+    def test_get_uri_double_prepends_bucket_without_scheme(self):
+        """Real ObjStoreLibStorage.get_uri double-prepends the bucket when
+        checkpoint_folder has no scheme — the root cause of storage#690.
+
+        Uses __new__ bypass (same pattern as test_obj_store_preflight.py) to
+        call get_uri without triggering _preflight or importing a storage backend.
+        """
+        from dlio_benchmark.storage.obj_store_lib import ObjStoreLibStorage
+        from types import SimpleNamespace
+
+        inst = ObjStoreLibStorage.__new__(ObjStoreLibStorage)
+        inst.uri_scheme = "s3"
+        inst.namespace = SimpleNamespace(name="my-bucket")
+
+        # Bare path (scheme stripped by storage#583) → double-bucket URI.
+        result = inst.get_uri("my-bucket/ckpt/llama3-8b")
+        assert result == "s3://my-bucket/my-bucket/ckpt/llama3-8b", (
+            "get_uri prepends namespace.name to a bare path, so a path that "
+            "already starts with the bucket gains it a second time."
+        )
+        # Confirm the fix's '://' short-circuit avoids this.
+        result_fixed = inst.get_uri("s3://my-bucket/ckpt/llama3-8b")
+        assert result_fixed == "s3://my-bucket/ckpt/llama3-8b"
+
+    # -- explicit exception: zero available → raises -------------------------
+
+    def test_zero_checkpoints_available_raises(self):
+        """_checkpoint() raises when walk_node returns fewer checkpoints than
+        requested — the exact exception seen in the storage#690 production bug.
+
+        Together with test_get_uri_double_prepends_bucket_without_scheme this
+        proves the full failure chain: bare path → get_uri double-prepends
+        bucket → listing hits wrong prefix → 0 results → this exception fires.
+        """
+        args = self._make_args("s3://my-bucket/ckpt/llama3-8b", num_checkpoints_read=3)
+        mock_storage = self._make_obj_storage(walk_return=[])  # wrong-prefix → empty
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None):
+            with pytest.raises(
+                Exception,
+                match=r"Number of checkpoints to be read: 3 is more than the number of checkpoints available: 0",
+            ):
+                bench._checkpoint()
+
+    # -- non-regression: local FS ----------------------------------------
+
+    def test_local_fs_storage_no_uri_scheme_folder_unchanged(self):
+        """Local-FS storage has no uri_scheme; checkpoint_folder must be unchanged."""
+        args = self._make_args("/local/ckpt/llama3-8b", num_checkpoints_read=1)
+
+        # FileStorage has no uri_scheme attribute.
+        mock_storage = MagicMock(spec=["walk_node"])
+        mock_storage.walk_node.return_value = ["step1/rank0.pt", "step1/rank1.pt"]
+
+        bench = _make_bench_for_checkpoint(args, mock_storage)
+        with patch.object(type(bench), '_checkpoint_write', lambda self: None), \
+             patch.object(type(bench), '_checkpoint_read', lambda self: None):
+            bench._checkpoint()
+
+        received = mock_storage.walk_node.call_args[0][0]
+        assert received == "/local/ckpt/llama3-8b"
