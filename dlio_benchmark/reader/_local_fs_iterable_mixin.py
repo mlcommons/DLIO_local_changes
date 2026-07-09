@@ -69,7 +69,24 @@ Subclass from BOTH the format-specific parent AND this mixin::
             self._localfs_prefetch_all()
             for batch in super().next():
                 yield batch
+
+``prefetch_window`` — SEMANTIC COLLISION (storage#626 bucket 1, docs part)
+=========================================================================
+On this mixin, ``storage_options.prefetch_window`` is the OUTER CHUNK SIZE
+for the windowed streaming loop (see ``_localfs_stream_next``, default
+256). Concurrency INSIDE a chunk is separately hardcoded to 64 (both the
+buffered POSIX ``ThreadPoolExecutor(max_workers=min(64, len(paths)))`` and
+the O_DIRECT ``s3dlio.get_many(max_in_flight=min(64, len(uris)))``).
+
+Raising ``prefetch_window`` raises the chunk size, not the in-flight
+concurrency. The same YAML key means something different on the S3 s3dlio
+path (Tokio sliding-window depth) and on the S3 minio path (chunk size
+with a fan-out capped at 16). See ``_s3_iterable_mixin`` module docstring
+for the full three-path table. Reconciling this into a single-meaning knob
+is out of scope for bucket 1 and is tracked under bucket 3 in
+storage#626.
 """
+
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
