@@ -62,10 +62,22 @@ Subclass from BOTH the format-specific parent AND this mixin::
 
 SUPPORTED LIBRARIES (strictly isolated — no cross-library fallback)
 ====================================================================
-  s3dlio           — get_many(); len(BytesView) is O(1), no Python bytes copy.
-  s3torchconnector — S3IterableDataset.from_objects() + sequential reader;
-                     reader.read() consumes the I/O; len() records byte count.
-  minio            — ThreadPoolExecutor + Minio.get_object(); len(resp.read()).
+  s3dlio           — get_many(max_in_flight=_MAX_PREFETCH_CONCURRENCY);
+                     len(BytesView) is O(1), no Python bytes copy.
+  s3torchconnector — S3IterableDataset.from_objects() readers are drained
+                     sequentially (network-free — SequentialS3Reader only
+                     opens its GetObject stream lazily on first .read()/
+                     .seek(), see s3torchconnector's SequentialS3Reader
+                     source), then .read() is fanned out across a
+                     ThreadPoolExecutor(max_workers=_MAX_PREFETCH_CONCURRENCY).
+  minio            — ThreadPoolExecutor(max_workers=_MAX_PREFETCH_CONCURRENCY)
+                     + Minio.get_object(); len(resp.read()).
+
+All three share ONE concurrency ceiling, ``_MAX_PREFETCH_CONCURRENCY``
+(storage#626 bucket 2) — a submitter's measured throughput should depend on
+the storage system, not which object-storage client library they picked.
+Before bucket 2, minio was hardcoded to 16 (a 4x cliff below s3dlio) and
+s3torchconnector was fully sequential (up to 64x below s3dlio).
 
 The configured library is validated at construction time (_s3_init). Misconfigured
 or missing libraries raise ImportError immediately, not later during I/O.
@@ -89,11 +101,16 @@ here so nobody assumes a single knob means a single thing.
   _s3_stream_next chunked path          Outer chunk size for the         256
   (this file, minio / s3torchconnector) Python-side windowed loop.
                                         Concurrency inside a chunk is
-                                        HARDCODED — 16 for minio
-                                        (_prefetch_minio) and 1 for
-                                        s3torchconnector (sequential
-                                        iterator). Raising prefetch_window
-                                        does NOT raise concurrency here.
+                                        HARDCODED to _MAX_PREFETCH_CONCURRENCY
+                                        (64) for both minio and
+                                        s3torchconnector as of storage#626
+                                        bucket 2 — previously 16 for minio
+                                        and 1 (fully sequential) for
+                                        s3torchconnector. Raising
+                                        prefetch_window still does NOT raise
+                                        concurrency here; it only changes
+                                        how many objects are grouped per
+                                        outer chunk.
 
   _local_fs_iterable_mixin              Outer chunk size for the         256
   ``_localfs_stream_next``              LocalFS windowed loop.
@@ -104,11 +121,15 @@ here so nobody assumes a single knob means a single thing.
                                         concurrency here either.
 
 Consequence: setting ``prefetch_window: 128`` in a YAML gives 128 in-flight
-GETs on s3dlio-S3, but on LocalFS/DIRECT_FS the outer chunk is 128 and the
-in-chunk fan-out is still capped at 64 — same on minio (chunk 128, fan-out
-16) and s3torchconnector (chunk 128, fan-out 1). Reconciling this into a
-single-meaning knob is out of scope for bucket 1 and is tracked as part of
-bucket 3 in storage#626 (LOCAL_FS/DIRECT_FS structural parity).
+GETs on s3dlio-S3, but on LocalFS/DIRECT_FS/minio/s3torchconnector the
+outer chunk is 128 and the in-chunk fan-out is still capped at 64 (as of
+storage#626 bucket 2, all four now agree on that in-chunk ceiling — bucket
+2 closed the minio/s3torchconnector 16x/64x gap; it did not unify the
+"outer chunk" vs "continuous sliding window" pipeline shape itself, which
+remains bucket 3 scope for LOCAL_FS/DIRECT_FS). Reconciling ``prefetch_window``
+into a single-meaning knob across ALL paths (not just the in-chunk ceiling)
+is tracked as part of bucket 3 in storage#626 (LOCAL_FS/DIRECT_FS structural
+parity).
 """
 
 import os
@@ -117,6 +138,16 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 from dlio_benchmark.utils.utility import utcnow
+
+# storage#626 bucket 2: single source of truth for prefetch fan-out, shared
+# by ALL THREE supported object-storage libraries (s3dlio, minio,
+# s3torchconnector) so a submitter's measured throughput reflects the
+# storage system under test, not which client library they picked. Before
+# this, s3dlio used 64, minio was hardcoded to 16 (an undocumented 4x
+# cliff), and s3torchconnector was fully sequential (depth 1, up to 64x
+# lower). Also matches the ceiling used by _local_fs_iterable_mixin's
+# buffered/O_DIRECT prefetch (bucket 3 scope to unify further).
+_MAX_PREFETCH_CONCURRENCY = 64
 
 
 class _S3IterableMixin:
@@ -214,8 +245,9 @@ class _S3IterableMixin:
 
         Created ONCE per worker process (lazy), reused across all epochs.
         Avoids rebuilding the urllib3 PoolManager and tearing down TCP connections
-        on every prefetch call. maxsize=16 matches max_workers=16 so no thread
-        ever blocks waiting for a free connection slot.
+        on every prefetch call. maxsize=_MAX_PREFETCH_CONCURRENCY matches
+        _prefetch_minio's max_workers so no thread ever blocks waiting for a
+        free connection slot.
 
         Raises ``ImportError`` if the minio package is not installed.
         """
@@ -248,7 +280,7 @@ class _S3IterableMixin:
 
         pool_kwargs = dict(
             timeout=urllib3.Timeout(connect=300, read=300),
-            maxsize=16,
+            maxsize=_MAX_PREFETCH_CONCURRENCY,
             retries=urllib3.Retry(
                 total=5,
                 backoff_factor=0.2,
@@ -287,7 +319,7 @@ class _S3IterableMixin:
 
         uris = [self._uri_for_obj_key(k) for k in obj_keys]
         uri_to_key = dict(zip(uris, obj_keys))
-        max_in_flight = min(64, len(uris))
+        max_in_flight = min(_MAX_PREFETCH_CONCURRENCY, len(uris))
         results = s3dlio.get_many(uris, max_in_flight=max_in_flight)
 
         cache = {}
@@ -297,10 +329,23 @@ class _S3IterableMixin:
 
     def _prefetch_s3torchconnector(self, obj_keys: list) -> dict:
         """
-        Fetch all objects via ``S3IterableDataset`` (one sequential GET per object).
+        Fetch all objects via ``S3IterableDataset``, concurrent GETs
+        (storage#626 bucket 2).
 
-        ``reader.read()`` consumes the full S3 transfer; ``len()`` records the byte
-        count. No numpy decode. s3dlio is not referenced in any way.
+        ``S3IterableDataset.__iter__()`` is drained sequentially first — this
+        is network-free. ``SequentialS3Reader.__init__`` only stores the
+        ``get_object_info``/``get_stream`` callables; the actual GetObject
+        request happens lazily inside ``.read()`` (via ``.prefetch()`` ->
+        ``self._get_stream()``). See s3torchconnector's
+        ``SequentialS3Reader`` source. A raw Python iterator is not safe to
+        call ``next()`` on from multiple threads at once, so materialising
+        the ``(obj_key, reader)`` pairs stays single-threaded; only the
+        ``.read()`` calls — where the real network I/O happens — are fanned
+        out across a ``ThreadPoolExecutor``, matching the concurrency
+        ceiling used by the ``s3dlio`` and ``minio`` prefetch paths.
+
+        ``len()`` records the byte count only; no numpy decode. s3dlio is
+        not referenced in any way — this path is fully independent.
 
         Iteration order of ``S3IterableDataset`` matches the order of ``uris``, so
         ``zip(obj_keys, dataset)`` is a safe one-to-one pairing.
@@ -317,9 +362,20 @@ class _S3IterableMixin:
             reader_constructor=S3ReaderConstructor.sequential(),
         )
 
+        # Sequential — cheap; constructs SequentialS3Reader handles without
+        # touching the network (see docstring above). The real I/O happens
+        # in reader.read() below, which IS run concurrently.
+        pairs = list(zip(obj_keys, dataset))
+
+        def _read_one(pair):
+            obj_key, reader = pair
+            return obj_key, len(reader.read())   # consume I/O; discard contents
+
+        n_workers = min(_MAX_PREFETCH_CONCURRENCY, max(1, len(pairs)))
         cache = {}
-        for obj_key, reader in zip(obj_keys, dataset):
-            cache[obj_key] = len(reader.read())   # consume I/O; discard contents
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            for obj_key, byte_count in pool.map(_read_one, pairs):
+                cache[obj_key] = byte_count
         return cache
 
     def _prefetch_minio(self, obj_keys: list) -> dict:
@@ -328,6 +384,9 @@ class _S3IterableMixin:
 
         Uses a cached Minio client (TCP keep-alive across epochs).
         ``len(resp.read())`` records the byte count. No numpy decode.
+        Concurrency ceiling is ``_MAX_PREFETCH_CONCURRENCY`` (storage#626
+        bucket 2) — previously hardcoded to 16, a 4x cliff below the
+        s3dlio path on identical storage.
         """
         client = self._get_minio_client()
 
@@ -344,7 +403,7 @@ class _S3IterableMixin:
                 resp.release_conn()
             return obj_key, len(raw)                  # byte count only
 
-        n_workers = min(16, max(1, len(obj_keys)))
+        n_workers = min(_MAX_PREFETCH_CONCURRENCY, max(1, len(obj_keys)))
         cache = {}
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             for obj_key, byte_count in pool.map(_fetch_one, obj_keys):

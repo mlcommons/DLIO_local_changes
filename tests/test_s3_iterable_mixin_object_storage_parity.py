@@ -49,6 +49,7 @@ Neither test touches a live S3 endpoint or requires ``minio`` to be
 installed — both fake the boundary (``_get_minio_client`` /
 ``S3IterableDataset.from_objects``) with barrier-blocking stand-ins.
 """
+
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -57,13 +58,14 @@ import pytest
 from dlio_benchmark.reader._s3_iterable_mixin import _S3IterableMixin
 
 
-CONCURRENCY_PROBE_N = 24       # > old minio ceiling (16), < new ceiling (64)
-BARRIER_TIMEOUT_S = 3.0        # generous for thread scheduling; RED fails fast
+CONCURRENCY_PROBE_N = 24  # > old minio ceiling (16), < new ceiling (64)
+BARRIER_TIMEOUT_S = 3.0  # generous for thread scheduling; RED fails fast
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_instance(storage_library):
     """Bare mixin instance driven through the real _s3_init() so
@@ -122,6 +124,7 @@ class _BarrierBlockingMinioClient:
 # MinIO — concurrency ceiling (RED against pre-fix code: capped at 16)
 # ---------------------------------------------------------------------------
 
+
 def test_prefetch_minio_runs_above_old_16_cap_concurrently():
     """storage#626 bucket 2: MinIO's ThreadPoolExecutor must run at least
     CONCURRENCY_PROBE_N (24) fetches concurrently — proving the ceiling is
@@ -163,6 +166,7 @@ def test_prefetch_minio_runs_above_old_16_cap_concurrently():
 # ---------------------------------------------------------------------------
 # s3torchconnector — sequential vs concurrent (RED against pre-fix code)
 # ---------------------------------------------------------------------------
+
 
 def test_prefetch_s3torchconnector_runs_reads_concurrently():
     """storage#626 bucket 2: s3torchconnector reads must run concurrently,
@@ -211,6 +215,7 @@ def test_prefetch_s3torchconnector_runs_reads_concurrently():
 # ---------------------------------------------------------------------------
 # Structural check: single shared ceiling, not per-library magic numbers
 # ---------------------------------------------------------------------------
+
 
 def test_shared_prefetch_concurrency_constant_exists():
     """All three prefetch methods must derive their concurrency ceiling from
