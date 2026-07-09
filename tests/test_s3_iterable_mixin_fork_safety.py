@@ -38,6 +38,7 @@ Test strategy
    the fix so a future refactor that reintroduces a module-level executor
    fails loudly instead of silently reintroducing the fork hazard.
 """
+
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
@@ -55,6 +56,7 @@ from dlio_benchmark.reader._s3_iterable_mixin import _S3IterableMixin
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_instance():
     """Bare mixin instance — same pattern as
@@ -105,6 +107,7 @@ def _child_body(result_queue):
 # Behavioural fork-safety test (RED against pre-fix code)
 # ---------------------------------------------------------------------------
 
+
 def test_prefetch_pool_survives_fork():
     """The S3 mixin's prefetch pool must be usable in a forked child.
 
@@ -154,22 +157,19 @@ def test_prefetch_pool_survives_fork():
             "(runs post-fork inside DLIO's worker_init)."
         )
 
-    assert not q.empty(), (
-        "child did not report a result; likely crashed silently"
-    )
+    assert not q.empty(), "child did not report a result; likely crashed silently"
     status, payload = q.get()
     assert status == "ok", (
         f"child failed to use the prefetch pool post-fork: status={status!r} "
         f"payload={payload!r} — this is the storage#626 bucket-1 hazard."
     )
-    assert payload == "post-fork-alive", (
-        f"unexpected payload from child: {payload!r}"
-    )
+    assert payload == "post-fork-alive", f"unexpected payload from child: {payload!r}"
 
 
 # ---------------------------------------------------------------------------
 # Structural check (RED against pre-fix code)
 # ---------------------------------------------------------------------------
+
 
 def test_no_module_level_prefetch_pool_in_s3_mixin():
     """The mixin module must not create a ThreadPoolExecutor at import
@@ -183,7 +183,8 @@ def test_no_module_level_prefetch_pool_in_s3_mixin():
     silently reintroducing the hang.
     """
     offenders = [
-        name for name, value in vars(_s3_iterable_mixin).items()
+        name
+        for name, value in vars(_s3_iterable_mixin).items()
         if isinstance(value, ThreadPoolExecutor)
     ]
     assert not offenders, (

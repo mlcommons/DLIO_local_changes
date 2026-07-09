@@ -69,15 +69,54 @@ SUPPORTED LIBRARIES (strictly isolated — no cross-library fallback)
 
 The configured library is validated at construction time (_s3_init). Misconfigured
 or missing libraries raise ImportError immediately, not later during I/O.
+
+``prefetch_window`` — SEMANTIC COLLISION (storage#626 bucket 1, docs part)
+=========================================================================
+The ``storage_options.prefetch_window`` key means different things on
+different code paths inside this codebase. A user who sets ``prefetch_window:
+128`` will get very different in-flight I/O concurrency depending on which
+library (and mixin) is on the hot path. This is a known collision documented
+here so nobody assumes a single knob means a single thing.
+
+  Path (library)                        prefetch_window means          default
+  --------------------------------------------------------------------  -------
+  _s3_stream_s3dlio (this file)         Tokio sliding-window in-flight   64
+                                        depth passed straight to
+                                        s3dlio.PyBytesAsyncDataLoader.
+                                        THIS IS THE ONE THAT ACTS AS A
+                                        CONCURRENCY KNOB.
+
+  _s3_stream_next chunked path          Outer chunk size for the         256
+  (this file, minio / s3torchconnector) Python-side windowed loop.
+                                        Concurrency inside a chunk is
+                                        HARDCODED — 16 for minio
+                                        (_prefetch_minio) and 1 for
+                                        s3torchconnector (sequential
+                                        iterator). Raising prefetch_window
+                                        does NOT raise concurrency here.
+
+  _local_fs_iterable_mixin              Outer chunk size for the         256
+  ``_localfs_stream_next``              LocalFS windowed loop.
+                                        Concurrency inside a chunk is
+                                        hardcoded 64 (both buffered POSIX
+                                        and O_DIRECT). Raising
+                                        prefetch_window does NOT raise
+                                        concurrency here either.
+
+Consequence: setting ``prefetch_window: 128`` in a YAML gives 128 in-flight
+GETs on s3dlio-S3, but on LocalFS/DIRECT_FS the outer chunk is 128 and the
+in-chunk fan-out is still capped at 64 — same on minio (chunk 128, fan-out
+16) and s3torchconnector (chunk 128, fan-out 1). Reconciling this into a
+single-meaning knob is out of scope for bucket 1 and is tracked as part of
+bucket 3 in storage#626 (LOCAL_FS/DIRECT_FS structural parity).
 """
+
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 from dlio_benchmark.utils.utility import utcnow
-
-_PREFETCH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="s3_prefetch")
 
 
 class _S3IterableMixin:
@@ -113,6 +152,21 @@ class _S3IterableMixin:
         # Incremented in _prefetch() from real len(data) — not a configured estimate.
         self._total_bytes_read: int = 0
         self._total_objects_read: int = 0
+
+        # storage#626 bucket 1: the prefetch pool is created HERE — per mixin
+        # instance, not at module import — because _s3_init runs from the
+        # subclass __init__ which in turn runs inside DLIO's worker_init(),
+        # i.e. strictly AFTER os.fork(). A module-level ThreadPoolExecutor
+        # would be built in the parent process at import time; its worker
+        # thread would not survive fork and every submit() in a child would
+        # enqueue work that nobody drains, hanging .result() indefinitely.
+        # Same hazard as the LOCAL_FS fix (storage#391, commit e4c9b7a).
+        # No explicit shutdown here — the pool lives for the worker
+        # process's lifetime and is cleaned up by interpreter teardown at
+        # process exit, matching the pre-fix module-level pool's lifecycle.
+        self._prefetch_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="s3_prefetch"
+        )
 
         if self._storage_library == "s3dlio":
             # s3dlio reads AWS_ENDPOINT_URL_S3 at import time; set early.
@@ -512,12 +566,12 @@ class _S3IterableMixin:
         chunks = [obj_keys[i : i + window] for i in range(0, total, window)]
 
         # Prime the pipeline: start fetching chunk 0 in background.
-        future = _PREFETCH_POOL.submit(self._prefetch, chunks[0])
+        future = self._prefetch_pool.submit(self._prefetch, chunks[0])
 
         for idx, chunk in enumerate(chunks):
             cache = future.result()
             if idx + 1 < len(chunks):
-                future = _PREFETCH_POOL.submit(self._prefetch, chunks[idx + 1])
+                future = self._prefetch_pool.submit(self._prefetch, chunks[idx + 1])
             else:
                 future = None
 
