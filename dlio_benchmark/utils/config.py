@@ -25,7 +25,8 @@ from typing import Any, Dict, List, ClassVar, Union
 from dlio_benchmark.common.constants import MODULE_CONFIG
 from dlio_benchmark.common.enumerations import StorageType, FormatType, Shuffle, ReadType, FileAccess, Compression, \
     FrameworkType, \
-    DataLoaderType, Profiler, DataLoaderSampler, CheckpointLocationType, CheckpointMechanismType, CheckpointModeType
+    DataLoaderType, Profiler, DataLoaderSampler, CheckpointLocationType, CheckpointMechanismType, CheckpointModeType, \
+    MPIState
 from dlio_benchmark.utils.utility import DLIOMPI, get_trace_name, utcnow
 from dlio_benchmark.utils.utility import Profile, PerfTrace, DFTRACER_ENABLE, DLIOLogger, OUTPUT_LEVEL, gen_random_tensor
 from dataclasses import dataclass
@@ -36,6 +37,72 @@ import numpy as np
 from typing import Optional, Dict
 
 dlp = Profile(MODULE_CONFIG)
+
+
+def _flush_page_caches_before_memory_guard(mpi):
+    """Drop the OS page cache on each host before the read_threads memory guard.
+
+    Called from ``ConfigArguments.validate`` immediately before
+    ``psutil.virtual_memory()`` is sampled. See storage#741 for the
+    long-form rationale; the short version:
+
+      * ``virtual_memory().available`` treats reclaimable page cache
+        (Lustre in particular) as unavailable, so a config that passed
+        the guard on the first (cold) run of a 5-run submission trips
+        the guard on runs 2..N when the client-side cache is warm.
+      * The benchmark itself drops that cache every epoch, so counting
+        it against the startup budget is internally inconsistent.
+      * A one-time flush per host, right before the guard reads
+        ``virtual_memory()``, makes the guard see the true free memory.
+
+    Design choices:
+      * Gated on ``local_rank() == 0`` so exactly one flush per host
+        runs (the OS write is idempotent within a host anyway). We use
+        ``local_rank()`` and NOT ``MPI.node()`` because the latter is
+        unreliable under ``--map-by node`` — the same anti-pattern PR
+        mlcommons/storage#675 fixed for the ``host_memory_GB``
+        collector array. ``local_rank()`` derives from
+        ``MPI.COMM_TYPE_SHARED``, independent of rank assignment.
+      * Same command (``sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'``)
+        as the per-epoch flush in ``main.py`` — privileges, kernel path,
+        and failure semantics are identical. No new operational
+        requirements.
+      * Fail-open: every failure mode (sudo refused, kernel timeout,
+        MPI barrier error) is swallowed. The guard downstream may
+        still trip on that host, which is exactly current behavior.
+      * Skipped entirely when MPI is not initialized (child processes,
+        harness paths) so unit-test contexts don't hit ``comm()``.
+
+    Args:
+        mpi: A ``DLIOMPI`` instance (injected for testability).
+    """
+    if getattr(mpi, "mpi_state", None) != MPIState.MPI_INITIALIZED:
+        return
+    import subprocess
+    # Lazy import — main.py imports config.py at module load, so a
+    # module-level ``from dlio_benchmark.main import ...`` would
+    # cycle.  By the time validate() runs, main.py has finished
+    # loading and this import is a cheap module-cache hit.
+    from dlio_benchmark.main import _resolve_drop_caches_timeout
+    if mpi.local_rank() == 0:
+        try:
+            subprocess.run(
+                ["sudo", "-n", "sh", "-c",
+                 "echo 3 > /proc/sys/vm/drop_caches"],
+                check=False,
+                timeout=_resolve_drop_caches_timeout(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except Exception:
+            # Match the per-epoch flush's fail-open posture in main.py.
+            pass
+    try:
+        mpi.comm().Barrier()
+    except Exception:
+        # Barrier failure should not mask the memory-guard check.
+        pass
 
 
 class VirtualIndexMap:
@@ -420,6 +487,12 @@ class ConfigArguments:
             import psutil
             ranks_per_node = DLIOMPI.get_instance().ranks_per_node()
             local_workers = self.read_threads * ranks_per_node
+            # storage#741: flush reclaimable page cache before sampling
+            # virtual_memory() so consecutive runs of a 5-run submission
+            # don't trip the guard on cache pinned by the prior run.
+            # See _flush_page_caches_before_memory_guard for full
+            # rationale and design choices.
+            _flush_page_caches_before_memory_guard(DLIOMPI.get_instance())
             # 512 MB per spawned worker is the minimum observed RSS (framework
             # imports only).  Compare against psutil.virtual_memory().available
             # with a 90% safety margin so already-used RAM is respected.
