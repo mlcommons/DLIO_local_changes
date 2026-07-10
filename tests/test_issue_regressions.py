@@ -1132,3 +1132,157 @@ class TestStorage690_CheckpointReadDoubleBucket:
 
         received = mock_storage.walk_node.call_args[0][0]
         assert received == "/local/ckpt/llama3-8b"
+
+
+# ===========================================================================
+# storage#754 — Hydra output_subdir mkdir race on multi-node runs
+# ===========================================================================
+#
+# main() calls the @hydra.main-decorated run_benchmark() unconditionally on
+# every MPI rank. Hydra's own run_job()/_save_config() internals do
+# Path(...).mkdir(parents=True, exist_ok=True) on the same shared
+# hydra.run.dir / output_subdir from every rank on every node. This is the
+# identical multi-host mkdir(exist_ok=True) race already fixed for DLIO's
+# own checkpoint directories in storage#699 (file_storage._makedirs_race_
+# safe): pathlib's post-FileExistsError is_dir() recheck can observe
+# transiently stale metadata from a peer node's just-completed mkdir.
+#
+# NOTE (misattributed bisection): the reporter bisected this to PR #43
+# (59f94801, storage#671). That commit only touches
+# dlio_benchmark/utils/utility.py's _resolve_local_ppn_and_rank() / leader-
+# Split gating -- nothing related to Hydra, main.py, or output_subdir.
+# Hydra's own directory creation also runs before run_benchmark(cfg)'s body
+# (and therefore before any of #43's changed code) ever executes. The
+# no-rank-gating design around the Hydra call itself dates to 9f5a8db0
+# (2023-06-20), long before any of the recent PR chain. See the storage#754
+# comment thread for the full writeup.
+
+
+class TestStorage754_HydraJobDirRaceOnMultiNodeRuns:
+    """Regression: Hydra's own Path.mkdir(parents=True, exist_ok=True) calls
+    during job bootstrap must tolerate the same cross-host stale-metadata
+    race already fixed for checkpoint directories (storage#699), routed
+    through the same trusted _makedirs_race_safe helper (storage#754)."""
+
+    # -- the core fix: Hydra-shaped mkdir calls route through the helper ----
+
+    def test_parents_true_exist_ok_true_routes_through_race_safe_helper(self):
+        """A Path.mkdir(parents=True, exist_ok=True) call inside the context
+        manager — Hydra's own call shape — must route through
+        _makedirs_race_safe, not bare pathlib.Path.mkdir."""
+        from pathlib import Path
+        from dlio_benchmark.utils.utility import race_safe_hydra_job_bootstrap
+
+        with patch("dlio_benchmark.storage.file_storage._makedirs_race_safe") as mock_fn:
+            with race_safe_hydra_job_bootstrap():
+                Path("/shared/hydra_log/model/2026-07-10-12-00-00/.hydra").mkdir(
+                    parents=True, exist_ok=True
+                )
+
+        mock_fn.assert_called_once_with(
+            "/shared/hydra_log/model/2026-07-10-12-00-00/.hydra", True
+        )
+
+    def test_survives_stale_cache_then_converges_via_path_mkdir(self):
+        """End-to-end through the real chain (Path.mkdir -> patched ->
+        _makedirs_race_safe -> retry): isdir() False twice (stale peer-node
+        cache) then True must NOT raise, proving the retry path actually
+        executes rather than the call getting lucky on the first check."""
+        from pathlib import Path
+        from dlio_benchmark.utils.utility import race_safe_hydra_job_bootstrap
+
+        with patch("dlio_benchmark.storage.file_storage.os.makedirs",
+                   side_effect=FileExistsError(17, "File exists")), \
+             patch("dlio_benchmark.storage.file_storage.os.path.isdir",
+                   side_effect=[False, False, True]) as mock_isdir, \
+             patch("dlio_benchmark.storage.file_storage.sleep") as mock_sleep:
+            with race_safe_hydra_job_bootstrap():
+                Path("/shared/hydra_log/model/run1/.hydra").mkdir(
+                    parents=True, exist_ok=True
+                )
+
+        assert mock_isdir.call_count == 3
+        assert mock_sleep.call_count == 2
+
+    # -- non-Hydra-shaped calls are untouched --------------------------------
+
+    def test_parents_false_passes_through_to_real_mkdir(self, tmp_path):
+        """mkdir(parents=False, ...) is not Hydra's call shape -- must hit
+        the real pathlib.Path.mkdir unchanged, including its normal
+        FileExistsError behavior when exist_ok=False."""
+        from dlio_benchmark.utils.utility import race_safe_hydra_job_bootstrap
+
+        target = tmp_path / "already_exists"
+        target.mkdir()
+
+        with patch("dlio_benchmark.storage.file_storage._makedirs_race_safe") as mock_fn:
+            with race_safe_hydra_job_bootstrap():
+                with pytest.raises(FileExistsError):
+                    target.mkdir(parents=False, exist_ok=False)
+
+        assert mock_fn.call_count == 0
+
+    def test_exist_ok_false_passes_through_to_real_mkdir(self, tmp_path):
+        """mkdir(parents=True, exist_ok=False) is not Hydra's call shape --
+        must hit the real pathlib.Path.mkdir unchanged."""
+        from dlio_benchmark.utils.utility import race_safe_hydra_job_bootstrap
+
+        target = tmp_path / "already_exists"
+        target.mkdir()
+
+        with patch("dlio_benchmark.storage.file_storage._makedirs_race_safe") as mock_fn:
+            with race_safe_hydra_job_bootstrap():
+                with pytest.raises(FileExistsError):
+                    target.mkdir(parents=True, exist_ok=False)
+
+        assert mock_fn.call_count == 0
+
+    def test_real_success_path_unaffected(self, tmp_path):
+        """The common case -- a brand-new directory, no race at all -- must
+        still work exactly as plain pathlib.Path.mkdir would."""
+        from dlio_benchmark.utils.utility import race_safe_hydra_job_bootstrap
+
+        target = tmp_path / "brand_new" / "nested"
+        with race_safe_hydra_job_bootstrap():
+            target.mkdir(parents=True, exist_ok=True)
+
+        assert target.is_dir()
+
+    # -- monkeypatch hygiene --------------------------------------------
+
+    def test_mkdir_restored_after_context_exits(self):
+        """pathlib.Path.mkdir must be restored to the original function once
+        the context manager exits -- no permanent monkeypatch leak."""
+        from pathlib import Path
+        from dlio_benchmark.utils.utility import race_safe_hydra_job_bootstrap
+
+        original = Path.mkdir
+        with race_safe_hydra_job_bootstrap():
+            assert Path.mkdir is not original
+        assert Path.mkdir is original
+
+    def test_mkdir_restored_even_on_exception(self):
+        """The monkeypatch must be undone even if the wrapped code raises."""
+        from pathlib import Path
+        from dlio_benchmark.utils.utility import race_safe_hydra_job_bootstrap
+
+        original = Path.mkdir
+        with pytest.raises(RuntimeError):
+            with race_safe_hydra_job_bootstrap():
+                raise RuntimeError("boom")
+        assert Path.mkdir is original
+
+    # -- wired into main() -------------------------------------------------
+
+    def test_main_wraps_run_benchmark_in_race_safe_bootstrap(self):
+        """main() must call run_benchmark() inside
+        race_safe_hydra_job_bootstrap() -- otherwise the fix never actually
+        applies to the real Hydra entry point (storage#754)."""
+        import inspect
+        from dlio_benchmark import main as main_module
+
+        src = inspect.getsource(main_module.main)
+        assert "race_safe_hydra_job_bootstrap" in src, (
+            "main() must wrap run_benchmark() in race_safe_hydra_job_bootstrap() "
+            "(storage#754) -- pre-fix unconditional run_benchmark() call still present"
+        )

@@ -16,6 +16,8 @@
 """
 
 import os
+import contextlib
+import pathlib
 from datetime import datetime
 import logging
 from time import time, sleep as base_sleep
@@ -231,6 +233,45 @@ def _resolve_local_ppn_and_rank(split_comm_size, split_comm_rank, env=None):
                 except (TypeError, ValueError):
                     mpi_local_rank = 0
     return local_ppn, mpi_local_rank
+
+
+@contextlib.contextmanager
+def race_safe_hydra_job_bootstrap():
+    """Tolerate Hydra's own multi-host job-directory race (storage#754).
+
+    Every MPI rank independently invokes the ``@hydra.main``-decorated entry
+    point, so Hydra's own ``run_job()``/``_save_config()`` internals call
+    ``pathlib.Path(...).mkdir(parents=True, exist_ok=True)`` on the same
+    shared ``hydra.run.dir`` / ``output_subdir`` from every rank on every
+    node. This is the identical multi-host mkdir(exist_ok=True) race already
+    fixed for DLIO's own checkpoint directories in storage#699 (see
+    ``file_storage._makedirs_race_safe``): pathlib's post-FileExistsError
+    ``is_dir()`` recheck can observe transiently stale metadata from a peer
+    node's just-completed mkdir on a shared/networked filesystem.
+
+    Hydra's own directory-creation code isn't ours to edit, so this
+    monkeypatches ``pathlib.Path.mkdir`` for the duration of the wrapped
+    call, routing any ``parents=True, exist_ok=True`` invocation (Hydra's
+    own call shape) through the same race-safe retry-with-backoff helper
+    already trusted for storage#699, instead of reimplementing the retry
+    logic a second time. Any other parents/exist_ok combination passes
+    through to the real ``pathlib.Path.mkdir`` unchanged.
+    """
+    from dlio_benchmark.storage.file_storage import _makedirs_race_safe
+
+    original_mkdir = pathlib.Path.mkdir
+
+    def _patched_mkdir(self, mode=0o777, parents=False, exist_ok=False):
+        if parents and exist_ok:
+            _makedirs_race_safe(str(self), exist_ok)
+            return None
+        return original_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    pathlib.Path.mkdir = _patched_mkdir
+    try:
+        yield
+    finally:
+        pathlib.Path.mkdir = original_mkdir
 
 
 # After the DLIOMPI singleton has been instantiated, the next call must be

@@ -93,7 +93,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 from dlio_benchmark.checkpointing.checkpointing_factory import CheckpointingFactory
 from dlio_benchmark.common.constants import MODULE_DLIO_BENCHMARK
 from dlio_benchmark.common.enumerations import DatasetType, MetadataType
-from dlio_benchmark.utils.utility import utcnow, DLIOMPI, Profile, dft_ai, DLIOLogger
+from dlio_benchmark.utils.utility import utcnow, DLIOMPI, Profile, dft_ai, DLIOLogger, race_safe_hydra_job_bootstrap
 from dlio_benchmark.utils.statscounter import StatsCounter
 from dlio_benchmark.utils.config import LoadConfig, ConfigArguments, GetConfig
 from dlio_benchmark.profiler.profiler_factory import ProfilerFactory
@@ -917,7 +917,11 @@ def main() -> None:
     The main method to start the benchmark runtime.
     """
     DLIOMPI.get_instance().initialize()
-    run_benchmark()
+    # storage#754: every rank independently drives Hydra's own job-directory
+    # bootstrap (hydra.run.dir / output_subdir); tolerate the resulting
+    # multi-host mkdir race the same way storage#699 does for checkpoint dirs.
+    with race_safe_hydra_job_bootstrap():
+        run_benchmark()
     DLIOMPI.get_instance().finalize()
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
