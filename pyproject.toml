@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dlio_benchmark"
-version = "3.0.3"
+version = "3.0.4"
 description = "An I/O benchmark for deep learning applications"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
