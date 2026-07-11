@@ -130,6 +130,25 @@ class MinIOAdapter:
 
         return MinioWriter(self.client, bucket_name, object_name)
 
+    def bucket_exists(self, bucket_name):
+        """Adapter for bucket_exists to match the S3Client API.
+
+        Delegates directly to `minio.Minio.bucket_exists()` — returns
+        True if the bucket is reachable and exists, False if the server
+        responds with a "no such bucket" error, and raises
+        `minio.S3Error` (or a transport exception like `urllib3`'s
+        `MaxRetryError`) on auth / endpoint / DNS / TLS failures.
+
+        `ObjStoreLibStorage._preflight()` catches those exceptions one
+        layer up and re-raises as `ConnectionError` with a message
+        pointing at endpoint / credentials / bucket name; this method
+        itself must NOT swallow them, since preflight relies on the
+        distinction between "bucket not found" (False return) and
+        "cannot reach endpoint" (exception) to compose the right
+        remediation hint (mlcommons/storage#756).
+        """
+        return self.client.bucket_exists(bucket_name)
+
     def list_objects(self, bucket_name, prefix=None):
         """Adapter for list_objects to match S3Client API"""
 
