@@ -284,49 +284,8 @@ class ObjStoreLibStorage(S3Storage):
                     logging.debug(f"s3dlio: set AWS_ENDPOINT_URL={self.endpoint}")
 
                 # Auto-tune the Tokio async runtime thread count (S3DLIO_RT_THREADS).
-                #
-                # By default s3dlio sets RT threads = max(4, num_cpus), which on a
-                # 128-core machine with NP=8 gives 128 RT threads/rank × 8 = 1,024
-                # total Tokio threads — all competing for 128 physical cores.  The
-                # runtime is saturated but the excess threads add scheduler overhead
-                # without increasing throughput.
-                #
-                # The actual in-flight concurrency is bounded by write_threads (the
-                # number of Python threads issuing concurrent PUT/GET calls).  The
-                # Tokio RT only needs enough threads to service those callers plus a
-                # small multiplier for async task fanout within each operation.
-                #
-                # Formula:  2 × write_threads, capped at 128.
-                #   - "× 2": each write thread may have one in-progress async task
-                #     plus one queued, so 2× prevents starvation.
-                #   - Cap 128: prevents runaway thread counts on very large machines
-                #     when write_threads is set unusually high.
-                #
-                # The sentinel _S3DLIO_RT_AUTO lets us distinguish:
-                #   - "user set this before launching" → respect it (no sentinel)
-                #   - "we auto-set it in an ancestor process (e.g. parent mlpstorage
-                #     before spawning mpirun)" → re-compute with the now-finalized
-                #     write_threads value, which may be higher than what the parent
-                #     computed (parent had write_threads=1 before auto-sizing ran).
-                _user_set = (
-                    "S3DLIO_RT_THREADS" in os.environ
-                    and "_S3DLIO_RT_AUTO" not in os.environ
-                )
-                if _user_set:
-                    logging.debug(
-                        f"s3dlio: S3DLIO_RT_THREADS={os.environ['S3DLIO_RT_THREADS']} "
-                        "(user-provided before launch, not overriding)"
-                    )
-                else:
-                    _write_threads = getattr(self._args, "write_threads", 8)
-                    _rt_threads = min(_write_threads * 3 // 2, 128)
-                    os.environ["S3DLIO_RT_THREADS"] = str(_rt_threads)
-                    os.environ["_S3DLIO_RT_AUTO"] = "1"   # sentinel: auto-set, may be re-computed
-                    logging.info(
-                        f"s3dlio: auto-set S3DLIO_RT_THREADS={_rt_threads} "
-                        f"(1.5 × write_threads={_write_threads}, cap=128). "
-                        "Set S3DLIO_RT_THREADS explicitly to override."
-                    )
+                # See _configure_s3dlio_runtime_env() for full rationale.
+                self._configure_s3dlio_runtime_env()
 
                 self.s3_client = None  # Not used for s3dlio
                 self._s3dlio = s3dlio
@@ -412,6 +371,86 @@ class ObjStoreLibStorage(S3Storage):
         # env would defeat the purpose (operators most likely to hit these
         # failure modes are exactly the ones who would not know to opt in).
         self._preflight()
+
+    def _configure_s3dlio_runtime_env(self):
+        """Set `S3DLIO_RT_THREADS` to hint s3dlio's global Tokio runtime at
+        a sensible worker count for this workload.
+
+        Historical rationale: pre-v0.9.112 s3dlio defaulted RT threads to
+        `max(4, num_cpus)`, which under `mpirun -n N` gave N × num_cpus
+        total Tokio threads competing for num_cpus physical cores.  DLIO's
+        fix was to auto-derive `S3DLIO_RT_THREADS = write_threads * 1.5
+        (cap 128)`, sized to the actual in-flight concurrency this rank
+        drives.
+
+        Timing subtlety (mlcommons/storage#780): ObjStoreLibStorage's
+        __init__ runs at [main.py:132](../main.py#L132), BEFORE
+        [main.py:505](../main.py#L505) `derive_configurations()` auto-
+        sizes `write_threads` from its dataclass default (1) to the real
+        value (e.g. 32).  Deriving `S3DLIO_RT_THREADS` from
+        `write_threads=1` gives 1, and s3dlio then builds its Tokio
+        runtime with a single worker — every concurrent multipart-upload
+        part serializes on that worker (~10x throughput loss, see
+        s3dlio's docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_
+        INVESTIGATION_2026-07-10.md).
+
+        Fix: skip the auto-derive when `write_threads` is still at the
+        auto-size sentinel (1); s3dlio v0.9.112+ handles MPI-aware
+        auto-sizing natively via its `_pymod`'s `configure_thread_pools(0)`
+        call at import time — one worker per available core divided by
+        the MPI world size, which is exactly the target that a downstream
+        `write_threads * 1.5` derivation would land near anyway.  s3dlio
+        v0.9.112+ also defends this class of miscomputation by clamping
+        env-var values below `RT_THREADS_LIMIT/4` up to `RT_THREADS_LIMIT`.
+        """
+        # If the user set S3DLIO_RT_THREADS explicitly before launching
+        # (no _S3DLIO_RT_AUTO sentinel present), respect their choice.
+        _user_set = (
+            "S3DLIO_RT_THREADS" in os.environ
+            and "_S3DLIO_RT_AUTO" not in os.environ
+        )
+        if _user_set:
+            logging.debug(
+                f"s3dlio: S3DLIO_RT_THREADS={os.environ['S3DLIO_RT_THREADS']} "
+                "(user-provided before launch, not overriding)"
+            )
+            return
+
+        _write_threads = getattr(self._args, "write_threads", 1)
+
+        # write_threads=1 is the auto-size sentinel set by ConfigArguments's
+        # dataclass default (see dlio_benchmark/utils/config.py's
+        # `write_threads: int = 1` and derive_configurations()'s auto-
+        # sizing block).  Deriving from the sentinel would poison
+        # s3dlio's runtime.  Leave S3DLIO_RT_THREADS unset and let
+        # s3dlio v0.9.112+ auto-size on its own.
+        if _write_threads <= 1:
+            # Also clear a stale ancestor auto-set (e.g. parent
+            # mlpstorage process auto-set to 1 based on its own not-yet-
+            # finalized write_threads).  Leaving that in place would
+            # preserve the poison; unsetting it hands sizing back to
+            # s3dlio's own MPI-aware default.
+            os.environ.pop("S3DLIO_RT_THREADS", None)
+            os.environ.pop("_S3DLIO_RT_AUTO", None)
+            logging.debug(
+                "s3dlio: write_threads is at the auto-size sentinel (1); "
+                "leaving S3DLIO_RT_THREADS unset.  s3dlio v0.9.112+ will "
+                "auto-size its Tokio runtime via configure_thread_pools(0) "
+                "at import time (MPI-aware: num_cpus / world_size)."
+            )
+            return
+
+        # User-explicit write_threads (>1 in YAML) or ancestor recompute:
+        # derive a matching Tokio RT thread count.  Formula: 1.5 x
+        # write_threads, capped at 128.
+        _rt_threads = min(_write_threads * 3 // 2, 128)
+        os.environ["S3DLIO_RT_THREADS"] = str(_rt_threads)
+        os.environ["_S3DLIO_RT_AUTO"] = "1"   # sentinel: auto-set
+        logging.info(
+            f"s3dlio: auto-set S3DLIO_RT_THREADS={_rt_threads} "
+            f"(1.5 x write_threads={_write_threads}, cap=128). "
+            "Set S3DLIO_RT_THREADS explicitly to override."
+        )
 
     def _preflight(self):
         """Validate endpoint, credentials, and bucket reachability at
