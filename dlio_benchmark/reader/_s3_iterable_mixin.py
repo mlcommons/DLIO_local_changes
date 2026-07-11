@@ -177,8 +177,8 @@ class _S3IterableMixin:
         # override by setting storage_library in storage_options.
         self._storage_library: str = opts.get("storage_library") or "s3dlio"
         self._opts: dict = opts
-        self._object_cache: dict = {}   # obj_key → int (raw byte count only)
-        self._minio_client = None       # cached across epochs for TCP keep-alive
+        self._object_cache: dict = {}  # obj_key → int (raw byte count only)
+        self._minio_client = None  # cached across epochs for TCP keep-alive
         # Actual bytes received from storage this epoch (reset in finalize_s3_bytes).
         # Incremented in _prefetch() from real len(data) — not a configured estimate.
         self._total_bytes_read: int = 0
@@ -207,7 +207,7 @@ class _S3IterableMixin:
 
         elif self._storage_library == "s3torchconnector":
             try:
-                from s3torchconnector import S3IterableDataset as _DS      # noqa: F401
+                from s3torchconnector import S3IterableDataset as _DS  # noqa: F401
                 from s3torchconnector.s3reader import S3ReaderConstructor as _RC  # noqa: F401
             except ImportError as exc:
                 raise ImportError(
@@ -276,7 +276,9 @@ class _S3IterableMixin:
             secure = False
 
         access_key = opts.get("access_key_id") or os.environ.get("AWS_ACCESS_KEY_ID")
-        secret_key = opts.get("secret_access_key") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+        secret_key = opts.get("secret_access_key") or os.environ.get(
+            "AWS_SECRET_ACCESS_KEY"
+        )
 
         pool_kwargs = dict(
             timeout=urllib3.Timeout(connect=300, read=300),
@@ -289,6 +291,7 @@ class _S3IterableMixin:
         )
         if secure:
             import certifi
+
             ca_bundle = os.environ.get("AWS_CA_BUNDLE") or certifi.where()
             pool = urllib3.PoolManager(
                 cert_reqs="CERT_REQUIRED", ca_certs=ca_bundle, **pool_kwargs
@@ -369,7 +372,7 @@ class _S3IterableMixin:
 
         def _read_one(pair):
             obj_key, reader = pair
-            return obj_key, len(reader.read())   # consume I/O; discard contents
+            return obj_key, len(reader.read())  # consume I/O; discard contents
 
         n_workers = min(_MAX_PREFETCH_CONCURRENCY, max(1, len(pairs)))
         cache = {}
@@ -401,7 +404,7 @@ class _S3IterableMixin:
             finally:
                 resp.close()
                 resp.release_conn()
-            return obj_key, len(raw)                  # byte count only
+            return obj_key, len(raw)  # byte count only
 
         n_workers = min(_MAX_PREFETCH_CONCURRENCY, max(1, len(obj_keys)))
         cache = {}
@@ -529,32 +532,99 @@ class _S3IterableMixin:
         loader = s3dlio.PyBytesAsyncDataLoader(ds, loader_opts)
         item_iter = loader.items()
 
+        # Proactive resource-shape warnings for the class of failures reported
+        # in mlcommons/storage#755 — on constrained co-located systems (e.g. a
+        # 16 GB / 8 CPU WSL VM running MinIO on the same host) an aggressive
+        # prefetch / worker configuration can silently exhaust file
+        # descriptors, RAM, or CPU headroom and surface as an opaque
+        # `RuntimeError: concurrent range chunk failed` mid-loop.  Compute the
+        # workload shape at this precise moment (we know prefetch and
+        # record_length here; DataLoader worker count and MPI ranks-per-node
+        # come from the args) and log any projections that look infeasible on
+        # this process's observable limits.  Never raises — this is diagnostic
+        # only.
+        try:
+            from dlio_benchmark.utils.resource_probe import (
+                emit_workload_warnings,
+            )
+
+            _dl_workers = int(getattr(args, "read_threads", 0) or 0) or 1
+            try:
+                from dlio_benchmark.utils.utility import DLIOMPI
+
+                _rpn = DLIOMPI.get_instance().ranks_per_node()
+            except Exception:  # noqa: BLE001
+                _rpn = 1
+            emit_workload_warnings(
+                f"{self.__class__.__name__}[thread={self.thread_index}]",
+                prefetch=prefetch,
+                dataloader_workers=_dl_workers,
+                record_length_bytes=record_bytes,
+                ranks_per_node=_rpn,
+            )
+        except Exception:  # noqa: BLE001
+            # Resource probing must never block the read path.
+            pass
+
         sample_buf = 0
         # collect_batch() releases the GIL once, drains collect_n items from the
         # Rust channel (blocking_recv × collect_n without touching the GIL), then
         # reacquires the GIL once to return a Python list.  Python iterates the
         # list — zero __next__() overhead.  Empty list signals end of stream.
-        while batch := item_iter.collect_batch(collect_n):
-            for item in batch:
-                # item.uri tells us which object arrived (completion order).
-                # len(item) is byte_count — O(1), no Python bytes copy needed.
-                obj_key = uri_to_key.get(item.uri, item.uri)
+        #
+        # On RuntimeError (typically s3dlio's "concurrent range chunk failed"
+        # under resource pressure — see mlcommons/storage#755), annotate with
+        # a live resource snapshot so the operator sees, in the traceback
+        # itself, whether fd exhaustion / RSS-near-limit / load-way-over-CPU
+        # was the shape of the failure at the moment it fired.  Never masks
+        # the original error — it survives as `__cause__` via `raise ... from`.
+        try:
+            while batch := item_iter.collect_batch(collect_n):
+                for item in batch:
+                    # item.uri tells us which object arrived (completion order).
+                    # len(item) is byte_count — O(1), no Python bytes copy needed.
+                    obj_key = uri_to_key.get(item.uri, item.uri)
 
-                # Store byte count in object cache so get_sample() / telemetry
-                # can read it.
-                self._object_cache[obj_key] = len(item)
-                self._total_bytes_read += len(item)
-                self._total_objects_read += 1
+                    # Store byte count in object cache so get_sample() / telemetry
+                    # can read it.
+                    self._object_cache[obj_key] = len(item)
+                    self._total_bytes_read += len(item)
+                    self._total_objects_read += 1
 
-                for s in range(num_spf):
-                    self.get_sample(obj_key, s)   # dlp + dft_ai image_size telemetry
-                    sample_buf += 1
-                    if sample_buf >= batch_size:
-                        yield dummy
-                        sample_buf -= batch_size
+                    for s in range(num_spf):
+                        self.get_sample(obj_key, s)  # dlp + dft_ai image_size telemetry
+                        sample_buf += 1
+                        if sample_buf >= batch_size:
+                            yield dummy
+                            sample_buf -= batch_size
 
-                # Release the byte-count entry; not needed across items.
-                self._object_cache.pop(obj_key, None)
+                    # Release the byte-count entry; not needed across items.
+                    self._object_cache.pop(obj_key, None)
+        except RuntimeError as exc:
+            # s3dlio surfaces its own errors as RuntimeError.  On constrained
+            # co-located systems this is often "concurrent range chunk failed"
+            # (mlcommons/storage#755); with the augment_error_with_snapshot
+            # helper the traceback now shows the exact resource state that
+            # was live at the moment of failure — no more opaque errors.
+            # The original exception stays visible as __cause__.
+            try:
+                from dlio_benchmark.utils.resource_probe import (
+                    augment_error_with_snapshot,
+                )
+
+                raise augment_error_with_snapshot(
+                    exc,
+                    (
+                        f"{self.__class__.__name__}._s3_stream_s3dlio "
+                        f"[thread={self.thread_index}, prefetch={prefetch}, "
+                        f"collect_n={collect_n}, uris={total}, "
+                        f"skip_head={skip_head}]"
+                    ),
+                ) from exc
+            except ImportError:
+                # If the probe module cannot import for some reason, do NOT
+                # eat the original error — re-raise verbatim.
+                raise
         # Drop-last: remaining sample_buf < batch_size is silently discarded.
 
     def _s3_stream_next(self):
@@ -603,7 +673,11 @@ class _S3IterableMixin:
         # Disable with storage_options.stagger_workers: false.
         if str(opts.get("stagger_workers", "true")).lower() not in ("false", "0", "no"):
             ct_raw = getattr(args, "computation_time", 0.0)
-            ct = ct_raw.get("mean", 0.0) if isinstance(ct_raw, dict) else float(ct_raw or 0.0)
+            ct = (
+                ct_raw.get("mean", 0.0)
+                if isinstance(ct_raw, dict)
+                else float(ct_raw or 0.0)
+            )
             delay = self.thread_index * ct
             if delay > 0:
                 self.logger.debug(
