@@ -1,8 +1,8 @@
 # Deep Learning I/O (DLIO) Benchmark
 ![test status](https://github.com/mlcommons/DLIO_local_changes/actions/workflows/fast-ci.yml/badge.svg)
-![version](https://img.shields.io/badge/version-3.0.1-blue)
+![version](https://img.shields.io/badge/version-3.0.3-blue)
 ![python](https://img.shields.io/badge/python-3.12-blue)
-![tests](https://img.shields.io/badge/tests-112%20passed-brightgreen)
+![tests](https://img.shields.io/badge/tests-412%20collected-brightgreen)
 
 > **This is the [MLCommons DLIO benchmark](https://github.com/mlcommons/DLIO_local_changes),
 > which is a temporary fork of the original [Argonne DLIO benchmark](https://github.com/argonne-lcf/dlio_benchmark).**
@@ -34,6 +34,7 @@
 - **MPI topology auto-sizing** — `read_threads` now divides by `ranks_per_node()` instead of total `comm_size`, giving correct per-node thread counts on multi-node runs.
 - **StatsCounter metrics** — fixed three bugs: negative throughput from a magic `(len - 2)` constant, unguarded division when the metric window is empty, and a dict-stomping bug in `batch_processed` that silently corrupted per-block data.
 - **Silent multipart corruption** (mlcommons/storage#593) — `MultipartUploadWriter` previously swallowed `CompleteMultipartUpload` errors and never verified the stored object size.  Fixed in s3dlio ≥ 0.9.104; DLIO now also wraps every multipart call in a retry loop (see Storage Backends bullet above).
+- **s3dlio runtime under-sizing on default configs** (v3.0.3) — `ObjStoreLibStorage.__init__` was deriving `S3DLIO_RT_THREADS = write_threads * 1.5` at storage-construction time, which runs BEFORE `derive_configurations()` auto-sizes `write_threads` from its dataclass sentinel (1). Result: the env var was being set to `1`, and s3dlio then built its Tokio runtime with a single worker — every concurrent multipart-upload part serialized on it (~9× throughput loss on unet3d datagen: live-measured 214 MB/s vs. 1928 MB/s at NP=1 after the fix). ObjStoreLibStorage now skips the auto-derive on the sentinel value (deferring to s3dlio ≥ 0.9.112's MPI-aware auto-sizing at import time), and s3dlio ≥ 0.9.112 additionally clamps env-var values below `RT_THREADS_LIMIT/4` up to the limit as a defense-in-depth. See [docs/S3DLIO_RT_THREADS_Sentinel_Fix_26-07-11.md](docs/S3DLIO_RT_THREADS_Sentinel_Fix_26-07-11.md).
 
 ### Testing
 - **112-test suite** — comprehensive `pytest`-based CI covering enumerations, config, all generator formats, parquet reader metadata and caching, StatsCounter metrics accuracy, issue regression guards, MPI smoke tests, and end-to-end smoke tests. The original upstream had no automated test suite.
