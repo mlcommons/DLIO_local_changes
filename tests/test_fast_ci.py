@@ -1448,3 +1448,187 @@ class TestEndToEndSmoke:
 
         output_jsons = glob.glob(os.path.join(out_dir, "*_output.json"))
         assert len(output_jsons) >= 1
+
+
+# ===========================================================================
+# 9. skip_listing: decouple the "_of_{total}" name suffix from the read
+#    count — mlcommons/storage datagen-manifest work (storage#571 Q4,
+#    storage#795 follow-up).
+#
+#    Under skip_listing every rank reconstructs its filenames from DLIO's
+#    naming convention, and that convention bakes the generated total into
+#    each name ("img_0003_of_257173.npz").  Before this change the run's
+#    ``num_files_train`` served as BOTH the name suffix and the read count,
+#    so a run could only ever consume a dataset generated with exactly the
+#    same count.  ``dataset.num_files_generated`` carries the generated
+#    total (0 = "same as num_files_train", i.e. the previous behaviour) so
+#    a run may read the first N of a larger generated set — restoring the
+#    "minimum <= run <= generated" contract that directory listing gave.
+#
+#    The name math also moves into a pure helper module so it can be pinned
+#    against the data generator's conventions without a full benchmark run.
+# ===========================================================================
+class TestSkipListingNumFilesGenerated:
+    """``dataset.num_files_generated`` + the pure skip-listing name helpers."""
+
+    def setup_method(self):
+        _reset()
+        from dlio_benchmark.utils.utility import DLIOMPI
+        DLIOMPI.get_instance().initialize()
+
+    def teardown_method(self):
+        _reset()
+
+    # --- config plumbing ------------------------------------------------------
+    def test_default_num_files_generated_is_zero(self):
+        from dlio_benchmark.utils.config import ConfigArguments
+        args = ConfigArguments.get_instance()
+        assert args.num_files_generated == 0
+
+    @pytest.mark.parametrize("raw", [257173, "257173"])
+    def test_load_config_propagates_num_files_generated(self, raw):
+        """Hydra CLI overrides arrive as strings; integer fields must coerce."""
+        from omegaconf import OmegaConf
+        from dlio_benchmark.utils.config import ConfigArguments, LoadConfig
+        args = ConfigArguments.get_instance()
+        LoadConfig(args, OmegaConf.create({"dataset": {"num_files_generated": raw}}))
+        assert args.num_files_generated == 257173
+
+    # --- pure name helpers (mirror data_generator.py conventions) -------------
+    def test_resolve_name_total_zero_means_num_files(self):
+        from dlio_benchmark.utils.skip_listing import resolve_name_total
+        assert resolve_name_total(num_files=4, num_files_generated=0) == 4
+
+    def test_resolve_name_total_uses_generated_when_larger(self):
+        from dlio_benchmark.utils.skip_listing import resolve_name_total
+        assert resolve_name_total(num_files=4, num_files_generated=10) == 10
+
+    def test_resolve_name_total_rejects_run_larger_than_generated(self):
+        from dlio_benchmark.utils.skip_listing import resolve_name_total
+        with pytest.raises(ValueError, match=r"num_files_train=12 .* num_files_generated=10"):
+            resolve_name_total(num_files=12, num_files_generated=10)
+
+    def test_file_relpath_flat_pads_index_to_generated_total_width(self):
+        """Width follows the generated total (len(str(10)) == 2), as the
+        generator's ``add_padding(i, len(str(num_files_train)))`` does."""
+        from dlio_benchmark.utils.skip_listing import file_relpath
+        assert file_relpath("img", "npz", idx=3, name_total=10, num_subfolders=0) == "img_03_of_10.npz"
+
+    def test_file_relpath_default_total_matches_previous_behaviour(self):
+        """generated=0 ⇒ names identical to the pre-change reconstruction."""
+        from dlio_benchmark.utils.skip_listing import file_relpath, resolve_name_total
+        total = resolve_name_total(num_files=4, num_files_generated=0)
+        assert file_relpath("img", "npz", idx=3, name_total=total, num_subfolders=0) == "img_3_of_4.npz"
+
+    def test_file_relpath_subfolder_pads_like_generator(self):
+        """data_generator pads the subfolder to ``len(str(num_subfolders))``
+        digits (10 subfolders → "03"), while the old inline reconstruction
+        used ``len(str(num_subfolders - 1))`` (→ "3").  Pin the generator."""
+        from dlio_benchmark.utils.skip_listing import file_relpath
+        assert file_relpath("img", "npz", idx=3, name_total=10, num_subfolders=10) == os.path.join("03", "img_03_of_10.npz")
+
+    def test_file_relpath_single_subfolder_is_flat_like_generator(self):
+        """data_generator only nests when ``num_subfolders > 1``."""
+        from dlio_benchmark.utils.skip_listing import file_relpath
+        assert file_relpath("img", "npz", idx=3, name_total=10, num_subfolders=1) == "img_03_of_10.npz"
+
+    def test_rank_indices_iterate_read_count_not_generated_total(self):
+        from dlio_benchmark.utils.skip_listing import rank_indices
+        assert list(rank_indices(num_files=4, rank=1, comm_size=2)) == [1, 3]
+
+    def test_validation_indices_cover_first_last_and_stride_of_read_count(self):
+        from dlio_benchmark.utils.skip_listing import validation_indices
+        assert validation_indices(num_files=4, interval=1000) == [0, 3]
+        assert validation_indices(num_files=7, interval=3) == [0, 3, 6]
+        assert validation_indices(num_files=0, interval=3) == []
+
+    # --- end to end: read 4 of 6 generated files under skip_listing ----------
+    @staticmethod
+    def _compose(data_dir, out_dir, *overrides):
+        from hydra import initialize_config_dir, compose
+        with initialize_config_dir(version_base=None, config_dir=_CONFIG_DIR):
+            return compose(config_name="config", overrides=[
+                "workload=unet3d_a100",
+                "++workload.dataset.format=npy",
+                "++workload.framework=tensorflow",
+                "++workload.reader.data_loader=tensorflow",
+                "++workload.dataset.num_files_eval=0",
+                "++workload.dataset.num_samples_per_file=2",
+                "++workload.dataset.record_length=256",
+                "++workload.dataset.record_length_stdev=0",
+                "++workload.train.epochs=1",
+                "++workload.train.computation_time=0.0",
+                f"++workload.output.folder={out_dir}",
+                f"++workload.dataset.data_folder={data_dir}",
+                *overrides,
+            ])
+
+    def _generate(self, data_dir, out_dir, num_files):
+        from omegaconf import OmegaConf
+        from dlio_benchmark.utils.config import ConfigArguments
+        from dlio_benchmark.main import DLIOBenchmark
+        cfg = self._compose(data_dir, out_dir,
+                            "++workload.workflow.generate_data=True",
+                            "++workload.workflow.train=False",
+                            f"++workload.dataset.num_files_train={num_files}")
+        ConfigArguments.reset()
+        bench = DLIOBenchmark(OmegaConf.to_container(cfg["workload"], resolve=True))
+        bench.initialize(); bench.run(); bench.finalize()
+
+    def _train_bench(self, data_dir, out_dir, num_files, num_files_generated):
+        from omegaconf import OmegaConf
+        from dlio_benchmark.utils.config import ConfigArguments
+        from dlio_benchmark.utils.utility import DLIOMPI
+        from dlio_benchmark.main import DLIOBenchmark
+        _reset()
+        DLIOMPI.get_instance().initialize()
+        cfg = self._compose(data_dir, out_dir,
+                            "++workload.workflow.generate_data=False",
+                            "++workload.workflow.train=True",
+                            "++workload.dataset.skip_listing=True",
+                            "++workload.dataset.listing_validation_interval=1",
+                            f"++workload.dataset.num_files_train={num_files}",
+                            f"++workload.dataset.num_files_generated={num_files_generated}")
+        ConfigArguments.reset()
+        workload = OmegaConf.to_container(cfg["workload"], resolve=True)
+        workload.setdefault("output", {})["folder"] = out_dir
+        return DLIOBenchmark(workload)
+
+    def test_train_reads_subset_of_larger_generated_set(self, tmpdir_clean):
+        import glob
+        from dlio_benchmark.utils.config import ConfigArguments
+        data_dir = str(tmpdir_clean / "data") + "/"
+        out_dir = str(tmpdir_clean / "output")
+        self._generate(data_dir, out_dir, num_files=6)
+        assert len(list((tmpdir_clean / "data").rglob("*.npy"))) == 6
+
+        bench = self._train_bench(data_dir, out_dir, num_files=4, num_files_generated=6)
+        bench.initialize()          # HEAD-validates every reconstructed name (interval=1)
+        args = ConfigArguments.get_instance()
+        assert len(args.file_list_train) == 4
+        assert all(p.endswith("_of_6.npy") for p in args.file_list_train)
+        assert all(os.path.isfile(p) for p in args.file_list_train)
+        bench.run(); bench.finalize()
+        assert glob.glob(os.path.join(out_dir, "*_output.json"))
+
+    def test_train_without_generated_total_keeps_previous_behaviour(self, tmpdir_clean):
+        """num_files_generated unset (0) ⇒ the read count is the name total."""
+        from dlio_benchmark.utils.config import ConfigArguments
+        data_dir = str(tmpdir_clean / "data") + "/"
+        out_dir = str(tmpdir_clean / "output")
+        self._generate(data_dir, out_dir, num_files=4)
+        bench = self._train_bench(data_dir, out_dir, num_files=4, num_files_generated=0)
+        bench.initialize()
+        args = ConfigArguments.get_instance()
+        assert len(args.file_list_train) == 4
+        assert all(p.endswith("_of_4.npy") for p in args.file_list_train)
+        bench.finalize()
+
+    def test_train_requesting_more_than_generated_fails_before_head_checks(self, tmpdir_clean):
+        data_dir = str(tmpdir_clean / "data") + "/"
+        out_dir = str(tmpdir_clean / "output")
+        self._generate(data_dir, out_dir, num_files=4)
+        bench = self._train_bench(data_dir, out_dir, num_files=8, num_files_generated=4)
+        with pytest.raises(Exception, match=r"num_files_train=8 .* num_files_generated=4"):
+            bench.initialize()
+        bench.finalize()
