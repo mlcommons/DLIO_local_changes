@@ -39,6 +39,13 @@ Every rank generates only its own round-robin slice
 (`index % comm_size == my_rank`) with **zero S3 API calls** and **zero MPI
 communication**.
 
+`{num_files}` in the name is the count the dataset was **generated** with.
+By default it is taken to be `num_files_train`, so a run can only consume a
+dataset generated with exactly that count.  Set `dataset.num_files_generated`
+to the generated total to read the first `num_files_train` files of a larger
+dataset (see below) — the same "read a subset" behaviour directory listing
+gives, where DLIO truncates the listed files to `num_files_train`.
+
 A sampling validation step (rank 0 only) then confirms the convention matches
 by checking a small fraction of URIs via HEAD requests.
 
@@ -123,6 +130,27 @@ skip_listing [train]: validating 50,001 of 50,000,000 files
 skip_listing [train]: validation complete — all 50,001 samples exist
     (103.6s, 483 checks/s); 781,250 URIs ready for rank 0
 ```
+
+
+### `dataset.num_files_generated` (int, default: `0`)
+
+The number of files the dataset was **generated** with.  Used only as the
+`_of_{total}` suffix (and its zero-pad width) when reconstructing names;
+`num_files_train` still decides how many files the run reads and validates.
+
+- `0` (default): the name total is `num_files_train` — the behaviour before this
+  parameter existed.  A run must then use exactly the generated count.
+- `N > 0`: the run reads files `0 .. num_files_train-1` of a dataset generated
+  with `N` files.  Lets a submitter generate once and run many configurations
+  against the first `num_files_train` files, restoring the
+  `minimum <= num_files_train <= generated` contract that directory listing
+  gives.
+- `num_files_train > num_files_generated` is rejected at startup with a clear
+  error, before any HEAD checks run (those names cannot exist).
+
+mlp-storage fills this from the datagen manifest it writes next to the dataset
+(`<data-dir>/<model>/.mlps-datagen-manifest.json`, `num_files_train` field).
+Only the training set is affected; `num_files_eval` keeps naming its own total.
 
 ---
 

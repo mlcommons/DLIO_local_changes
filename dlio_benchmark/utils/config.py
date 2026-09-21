@@ -303,6 +303,13 @@ class ConfigArguments:
     # The first file, last file, and every N-th file are checked via HEAD
     # (s3dlio.exists() / os.path.isfile()).  Set to 0 to disable validation.
     listing_validation_interval: int = 1000
+    # Number of files the dataset was GENERATED with, used only as the
+    # "_of_{total}" suffix (and its zero-pad width) when skip_listing
+    # reconstructs names.  0 = same as num_files_train (previous behaviour).
+    # Lets a run read the first num_files_train files of a larger generated
+    # set, as directory listing always allowed.  mlpstorage fills this from
+    # the datagen manifest (storage#571 Q4 / storage#795 follow-up).
+    num_files_generated: int = 0
 
     # derived fields
     required_samples: int = 1
@@ -1685,6 +1692,8 @@ def LoadConfig(args, config):
                 args.skip_listing = bool(raw)
         if 'listing_validation_interval' in config['dataset']:
             args.listing_validation_interval = int(config['dataset']['listing_validation_interval'])
+        if 'num_files_generated' in config['dataset']:
+            args.num_files_generated = int(config['dataset']['num_files_generated'])
 
         # parquet only config
         if 'parquet' in config['dataset']:

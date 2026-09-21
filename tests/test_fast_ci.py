@@ -1631,4 +1631,3 @@ class TestSkipListingNumFilesGenerated:
         bench = self._train_bench(data_dir, out_dir, num_files=8, num_files_generated=4)
         with pytest.raises(Exception, match=r"num_files_train=8 .* num_files_generated=4"):
             bench.initialize()
-        bench.finalize()

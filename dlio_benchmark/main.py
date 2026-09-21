@@ -94,6 +94,8 @@ from dlio_benchmark.checkpointing.checkpointing_factory import CheckpointingFact
 from dlio_benchmark.common.constants import MODULE_DLIO_BENCHMARK
 from dlio_benchmark.common.enumerations import DatasetType, MetadataType
 from dlio_benchmark.utils.utility import utcnow, DLIOMPI, Profile, dft_ai, DLIOLogger, race_safe_hydra_job_bootstrap
+from dlio_benchmark.utils.skip_listing import (
+    file_relpath, rank_indices, resolve_name_total, validation_indices)
 from dlio_benchmark.utils.statscounter import StatsCounter
 from dlio_benchmark.utils.config import LoadConfig, ConfigArguments, GetConfig
 from dlio_benchmark.profiler.profiler_factory import ProfilerFactory
@@ -281,27 +283,35 @@ class DLIOBenchmark(object):
                     # ── Deterministic file list (skip S3 listing entirely) ─
                     # Generate file URIs from DLIO's naming convention without
                     # any storage API calls or MPI communication.  Each rank
-                    # independently computes its own round-robin shard.
-                    # Convention: {file_prefix}_{index:0N}_of_{total}.{format}
-                    # For subfoldered layouts: {subfolder}/{file_prefix}_{index:0N}_of_{total}.{format}
-                    # where subfolder = str(index % num_subfolders).zfill(nd_sf)
+                    # independently computes its own round-robin shard.  The
+                    # name math lives in utils/skip_listing.py so it can be
+                    # pinned against data_generator.py's conventions.
+                    #
+                    # The "_of_{total}" suffix is the GENERATED count
+                    # (dataset.num_files_generated, 0 = same as the read
+                    # count); the read count decides how many names are
+                    # built and validated.  A run may therefore read the
+                    # first N files of a larger generated set, as directory
+                    # listing always allowed.
                     num_files_expected = (
                         self.num_files_train if dataset_type is DatasetType.TRAIN
                         else (self.num_files_eval if self.do_eval else 0)
                     )
+                    if dataset_type is DatasetType.TRAIN:
+                        name_total = resolve_name_total(
+                            num_files_expected, self.args.num_files_generated)
+                    else:
+                        name_total = num_files_expected
+
+                    def _uri_for(idx):
+                        rel = file_relpath(self.args.file_prefix, self.args.format,
+                                           idx, name_total, num_subfolders)
+                        return self.storage.get_uri(
+                            os.path.join(self.args.data_folder, f"{dataset_type}", rel))
+
                     if num_files_expected > 0:
-                        nd_f = len(str(num_files_expected))
-                        nd_sf = len(str(max(num_subfolders - 1, 0))) if num_subfolders > 0 else 0
-                        for idx in range(self.my_rank, num_files_expected, self.comm_size):
-                            fname = f"{self.args.file_prefix}_{str(idx).zfill(nd_f)}_of_{num_files_expected}.{self.args.format}"
-                            if num_subfolders > 0:
-                                sf = str(idx % num_subfolders).zfill(nd_sf)
-                                rel = os.path.join(sf, fname)
-                            else:
-                                rel = fname
-                            uri = self.storage.get_uri(
-                                os.path.join(self.args.data_folder, f"{dataset_type}", rel))
-                            my_files.append(uri)
+                        for idx in rank_indices(num_files_expected, self.my_rank, self.comm_size):
+                            my_files.append(_uri_for(idx))
                         global_count = num_files_expected
                     # ── Sampling validation (rank 0 only) ─────────────
                     # Confirm the naming convention is correct by checking
@@ -312,10 +322,7 @@ class DLIOBenchmark(object):
                     if self.my_rank == 0 and num_files_expected > 0 and \
                             self.args.listing_validation_interval > 0:
                         interval = self.args.listing_validation_interval
-                        val_indices = sorted(
-                            {0, num_files_expected - 1} |
-                            set(range(0, num_files_expected, interval))
-                        )
+                        val_indices = validation_indices(num_files_expected, interval)
                         n_checks = len(val_indices)
                         # ── Header: tell the user what is about to happen ──
                         self.logger.output(
@@ -328,14 +335,7 @@ class DLIOBenchmark(object):
                         # every 500 checks and no more often than every 100.
                         progress_stride = max(100, min(500, n_checks // 10))
                         for check_num, vidx in enumerate(val_indices):
-                            vfname = f"{self.args.file_prefix}_{str(vidx).zfill(nd_f)}_of_{num_files_expected}.{self.args.format}"
-                            if num_subfolders > 0:
-                                vsf = str(vidx % num_subfolders).zfill(nd_sf)
-                                vrel = os.path.join(vsf, vfname)
-                            else:
-                                vrel = vfname
-                            vuri = self.storage.get_uri(
-                                os.path.join(self.args.data_folder, f"{dataset_type}", vrel))
+                            vuri = _uri_for(vidx)
                             if not self.storage.file_exists(vuri):
                                 failed_uris.append(vuri)
                             # Periodic progress line (but not on the very first check)
