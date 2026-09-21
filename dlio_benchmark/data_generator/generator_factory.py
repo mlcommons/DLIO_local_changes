@@ -53,5 +53,8 @@ class GeneratorFactory(object):
         elif type == FormatType.PARQUET:
             from dlio_benchmark.data_generator.parquet_generator import ParquetGenerator
             return ParquetGenerator()
+        elif type == FormatType.ARROW:
+            from dlio_benchmark.data_generator.arrow_generator import ArrowGenerator
+            return ArrowGenerator()
         else:
             raise Exception(str(ErrorCodes.EC1001))
