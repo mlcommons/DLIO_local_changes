@@ -56,6 +56,7 @@ DLIO supports multiple storage backends out of the box:
 - **Local filesystem** — the default, for NFS, Lustre, GPFS, and local NVMe
 - **AWS S3 / S3-compatible object storage** — via [s3dlio](https://pypi.org/project/s3dlio/), [s3torchconnector](https://github.com/awslabs/s3-connector-for-pytorch), or the [MinIO Python SDK](https://min.io/docs/minio/linux/developers/python/API.html)
 - **AIStore** — via the native AIStore Python SDK
+- **DAOS** — natively through libdfs, without dfuse (`storage_type: daos`; see [docs/DAOS.md](docs/DAOS.md))
 
 Object storage backends are configured through the `storage:` block in the workload YAML file (see [Object Storage Configuration](#object-storage-configuration) below).
 

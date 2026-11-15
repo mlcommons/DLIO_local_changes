@@ -739,6 +739,23 @@ class ConfigArguments:
     def reset():
         ConfigArguments.__instance = None
 
+    def _apply_daos_spawn_policy(self):
+        """storage_type=daos: DataLoader workers must not be forked.
+
+        The parent connects to DAOS before workers exist, and the DAOS client
+        state (network endpoints, progress threads) does not survive fork().
+        Spawned workers open their own connection in worker_init.
+        """
+        if (self.storage_type == StorageType.DAOS
+                and self.multiprocessing_context == "fork"):
+            self.logger.info(
+                "Auto-setting multiprocessing_context='spawn' for "
+                "storage_type='daos'. fork is unsafe after the parent has "
+                "connected to DAOS. Set reader.multiprocessing_context: spawn "
+                "explicitly in your YAML to suppress this message."
+            )
+            self.multiprocessing_context = "spawn"
+
     @dlp.log
     def derive_configurations(self, file_list_train=None, file_list_eval=None):
         # Initialize data generation method from config or environment.
@@ -929,6 +946,7 @@ class ConfigArguments:
                 "explicitly in your YAML to suppress this message."
             )
             self.multiprocessing_context = "spawn"
+        self._apply_daos_spawn_policy()
 
         # PR-5: Auto-size read_threads when the user has not set an explicit
         # value (the dataclass default is 1).  Values > 1 in the YAML are

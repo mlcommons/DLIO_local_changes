@@ -38,6 +38,10 @@ class ReaderFactory(object):
             if DLIOMPI.get_instance().rank() == 0:
                 self.logger.info(f"{utcnow()} Running DLIO with custom data loader class {_args.reader_class.__name__}")
             return _args.reader_class(dataset_type, thread_index, epoch_number)
+        elif _args.storage_type == StorageType.DAOS and type not in (
+                FormatType.NPZ, FormatType.NPY, FormatType.JPEG, FormatType.PNG,
+                FormatType.TFRECORD, FormatType.PARQUET):
+            raise Exception("Loading data of %s format is not supported with storage_type=daos" % type)
         elif type == FormatType.HDF5:
             if _args.odirect == True:
                 raise Exception("Odirect for %s format is not yet supported." %type)
@@ -95,6 +99,9 @@ class ReaderFactory(object):
         elif type == FormatType.TFRECORD:
             if _args.odirect == True:
                 raise Exception("O_DIRECT for %s format is not yet supported." %type)
+            elif _args.storage_type == StorageType.DAOS:
+                from dlio_benchmark.reader.tfrecord_reader_dfs_iterable import TFRecordReaderDfsIterable
+                return TFRecordReaderDfsIterable(dataset_type, thread_index, epoch_number)
             elif (getattr(_args, "storage_options", {}) or {}).get("storage_library") == "s3dlio":
                 # s3dlio handles both s3:// and file:// URIs.
                 from dlio_benchmark.reader.tfrecord_reader_s3_iterable import TFRecordReaderS3Iterable
@@ -126,6 +133,9 @@ class ReaderFactory(object):
         elif type == FormatType.PARQUET:
             if _args.odirect == True:
                 raise Exception("O_DIRECT for %s format is not yet supported." %type)
+            if _args.storage_type == StorageType.DAOS:
+                from dlio_benchmark.reader.parquet_reader_dfs_iterable import ParquetReaderDfsIterable
+                return ParquetReaderDfsIterable(dataset_type, thread_index, epoch_number)
             # s3dlio streaming loader: unified path for all URI schemes
             # (s3://, file://, direct://, az://, gs://).
             # Opt-in via storage_options.storage_library: s3dlio.

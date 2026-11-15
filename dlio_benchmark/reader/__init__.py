@@ -38,6 +38,9 @@ def _storage_info():
 
 def create_npz_reader(dataset_type, thread_index, epoch):
     storage_type, library = _storage_info()
+    if storage_type == StorageType.DAOS:
+        from dlio_benchmark.reader.npz_reader_dfs_iterable import NPZReaderDfsIterable
+        return NPZReaderDfsIterable(dataset_type, thread_index, epoch)
     if storage_type in _S3_TYPES:
         if library in _S3_LIBS:
             from dlio_benchmark.reader.npz_reader_s3_iterable import NPZReaderS3Iterable
@@ -57,6 +60,9 @@ def create_npz_reader(dataset_type, thread_index, epoch):
 
 def create_npy_reader(dataset_type, thread_index, epoch):
     storage_type, library = _storage_info()
+    if storage_type == StorageType.DAOS:
+        from dlio_benchmark.reader.npy_reader_dfs_iterable import NPYReaderDfsIterable
+        return NPYReaderDfsIterable(dataset_type, thread_index, epoch)
     if storage_type in _S3_TYPES:
         if library in _S3_LIBS:
             from dlio_benchmark.reader.npy_reader_s3_iterable import NPYReaderS3Iterable
@@ -74,6 +80,9 @@ def create_npy_reader(dataset_type, thread_index, epoch):
 
 def create_image_reader(dataset_type, thread_index, epoch):
     storage_type, library = _storage_info()
+    if storage_type == StorageType.DAOS:
+        from dlio_benchmark.reader.image_reader_dfs_iterable import ImageReaderDfsIterable
+        return ImageReaderDfsIterable(dataset_type, thread_index, epoch)
     if storage_type in _S3_TYPES:
         if library in _S3_LIBS:
             from dlio_benchmark.reader.image_reader_s3_iterable import ImageReaderS3Iterable

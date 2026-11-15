@@ -102,6 +102,7 @@ from dlio_benchmark.profiler.profiler_factory import ProfilerFactory
 from dlio_benchmark.framework.framework_factory import FrameworkFactory
 from dlio_benchmark.data_generator.generator_factory import GeneratorFactory
 from dlio_benchmark.storage.storage_factory import StorageFactory
+from dlio_benchmark.storage.dfs_precheck import check_daos_config
 
 dlp = Profile(MODULE_DLIO_BENCHMARK)
 
@@ -129,6 +130,8 @@ class DLIOBenchmark(object):
         t0 = time.time()
         self.args = ConfigArguments.get_instance()
         LoadConfig(self.args, cfg)
+        # storage_type=daos: reject unsupported settings before connecting.
+        check_daos_config(self.args)
 
 
         self.storage = StorageFactory().get_storage(self.args.storage_type, self.args.storage_root,
@@ -570,6 +573,11 @@ class DLIOBenchmark(object):
             ckpt_folder = self.args.checkpoint_folder
             if '://' not in str(ckpt_folder) and hasattr(self.storage, 'uri_scheme'):
                 ckpt_folder = f"{self.storage.uri_scheme}://{ckpt_folder}"
+            if self.args.storage_type == _StorageType.DAOS:
+                # Same container path as the checkpoint storage namespace
+                # (base_checkpointing), independent of storage_root.
+                from dlio_benchmark.storage.dfs_client import normalize_path
+                ckpt_folder = normalize_path(ckpt_folder)
             num_checkpoints_exists = len(self.storage.walk_node(ckpt_folder))
         else:
             num_checkpoints_exists = None
@@ -895,6 +903,9 @@ class DLIOBenchmark(object):
         self.comm.barrier()
         if dftracer_finalize and dftracer:
             self.args.finalize_dftracer(dftracer)
+        if self.args.storage_type == _StorageType.DAOS:
+            from dlio_benchmark.storage.dfs_client import close_all
+            close_all()
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")

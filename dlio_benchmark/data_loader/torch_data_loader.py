@@ -153,6 +153,24 @@ def _is_torch_shm_reaped_error(exc: BaseException) -> bool:
     return all(token in msg for token in _TORCH_SHM_UNLINK_ENOENT_PATTERNS)
 
 
+def _daos_worker_init(worker_id):
+    """storage_type=daos: open this DataLoader worker's DFS connection.
+
+    Called from worker_init after the parent's arguments are restored.  The
+    connection is closed once when the worker process exits.  In-process
+    loading (worker_id < 0) keeps using the parent's connection.
+    """
+    if worker_id < 0:
+        return
+    from dlio_benchmark.common.enumerations import StorageType
+    args = ConfigArguments.get_instance()
+    if args.storage_type != StorageType.DAOS:
+        return
+    from dlio_benchmark.storage.dfs_client import get_worker_client
+    from dlio_benchmark.storage.dfs_precheck import daos_connection_options
+    get_worker_client(*daos_connection_options(args))
+
+
 class TorchDataset(Dataset):
     """
     Currently, we only support loading one sample per file
@@ -179,6 +197,7 @@ class TorchDataset(Dataset):
         pickle.loads(self.serial_args)
         _args = ConfigArguments.get_instance()
         _args.configure_dlio_logging(is_child=True)
+        _daos_worker_init(worker_id)
         self.logger.debug(f"{utcnow()} worker initialized {worker_id} with format {self.format_type}")
         self.reader = ReaderFactory.get_reader(type=self.format_type,
                                                dataset_type=self.dataset_type,
@@ -243,6 +262,7 @@ class TorchIterableDataset(IterableDataset):
         pickle.loads(self.serial_args)
         _args = ConfigArguments.get_instance()
         _args.configure_dlio_logging(is_child=True)
+        _daos_worker_init(worker_id)
         self.reader = ReaderFactory.get_reader(
             type=self.format_type,
             dataset_type=self.dataset_type,
@@ -475,6 +495,7 @@ class TorchIterableDatasetSimple(IterableDataset):
         pickle.loads(self.serial_args)
         _args = ConfigArguments.get_instance()
         _args.configure_dlio_logging(is_child=True)
+        _daos_worker_init(worker_id)
         # When num_workers=0 the training loop runs in the main process;
         # file_map is built for thread 0 (num_threads=1 when read_threads=0).
         thread_idx = 0 if worker_id < 0 else worker_id
@@ -613,10 +634,10 @@ class TorchDataLoader(BaseDataLoader):
         )
         use_rg_iterable_dataset = (
             self.format_type is FormatType.PARQUET
-            and self._args.storage_type in (
+            and (self._args.storage_type in (
                 StorageType.S3, StorageType.AISTORE,
                 StorageType.LOCAL_FS,
-            )
+            ) or self._args.storage_type == StorageType.DAOS)
         )
         _s3_types = (StorageType.S3, StorageType.AISTORE, StorageType.DIRECT_FS)
         # TorchIterableDatasetSimple uses DataLoader(num_workers>0) which forks
@@ -629,7 +650,8 @@ class TorchDataLoader(BaseDataLoader):
         use_simple_iterable_dataset = (
             self.format_type in _simple_iterable_formats
             and not use_rg_iterable_dataset
-            and self._args.storage_type in _s3_types
+            and (self._args.storage_type in _s3_types
+                 or self._args.storage_type == StorageType.DAOS)
         )
 
         # Determine concrete reader class name and access pattern for logging.
@@ -639,13 +661,24 @@ class TorchDataLoader(BaseDataLoader):
         _s3_libs  = ("s3dlio", "s3torchconnector", "minio")
         _nw = self._args.read_threads
 
-        if use_rg_iterable_dataset:
+        if use_rg_iterable_dataset and _st == StorageType.DAOS:
+            _reader_cls    = "ParquetReaderDfsIterable"
+            _torch_ds      = "TorchIterableDataset(rg-granular)"
+            _sample_access = "iterator(row-group range reads, libdfs)"
+        elif use_rg_iterable_dataset:
             _reader_cls    = "ParquetReaderS3dlio"
             _torch_ds      = "TorchIterableDataset(rg-granular)"
             _sample_access = "iterator(row-group chunks)"
         elif use_simple_iterable_dataset:
             _fmt = str(self.format_type).split(".")[-1].lower()
-            if _st in _s3_types and _lib in _s3_libs:
+            if _st == StorageType.DAOS:
+                _reader_cls = (
+                    "NPZReaderDfsIterable"   if self.format_type is FormatType.NPZ  else
+                    "NPYReaderDfsIterable"   if self.format_type is FormatType.NPY  else
+                    "ImageReaderDfsIterable"
+                )
+                _sample_access = "next()->_dfs_stream_next(libdfs, ThreadPool-64) then iterate"
+            elif _st in _s3_types and _lib in _s3_libs:
                 _reader_cls = (
                     "NPZReaderS3Iterable"   if self.format_type is FormatType.NPZ  else
                     "NPYReaderS3Iterable"   if self.format_type is FormatType.NPY  else

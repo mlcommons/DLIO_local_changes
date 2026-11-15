@@ -110,6 +110,16 @@ class PyTorchCheckpointing(BaseCheckpointing):
         if not hasattr(self, '_streaming_cache'):
             self._streaming_cache = {}
 
+        if getattr(self.args, 'storage_type', None) == StorageType.DAOS:
+            if 'daos' not in self._streaming_cache:
+                from dlio_benchmark.checkpointing.dfs_streaming_checkpointing import (
+                    DfsStreamingCheckpointing,
+                )
+                self._streaming_cache['daos'] = DfsStreamingCheckpointing(
+                    chunk_size=32 * 1024 * 1024,
+                )
+            return self._streaming_cache['daos']
+
         if cache_key not in self._streaming_cache:
             try:
                 from mlpstorage_py.checkpointing import StreamingCheckpointing as _SC
