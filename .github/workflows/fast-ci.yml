@@ -94,6 +94,11 @@ jobs:
         # XML rather than trusting mpirun's exit code.
         run: |
           python -m pytest tests/test_fast_ci.py \
+            tests/test_dfs_client_binding.py \
+            tests/test_dfs_storage.py \
+            tests/test_dfs_readers.py \
+            tests/test_dfs_checkpointing.py \
+            tests/dlio_daos_benchmark_test.py \
             --tb=short -v \
             --junitxml=fast-ci-results-${{ matrix.install_method }}.xml \
             || code=$?; \

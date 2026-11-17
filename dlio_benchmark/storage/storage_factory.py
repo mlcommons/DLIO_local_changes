@@ -55,5 +55,9 @@ class StorageFactory(object):
                 from dlio_benchmark.storage.obj_store_lib import ObjStoreLibStorage
                 return ObjStoreLibStorage(namespace, framework)
             return S3Storage(namespace, framework)
+        elif storage_type == StorageType.DAOS:
+            # Native DAOS through libdfs; libdfs.so is loaded on first connect.
+            from dlio_benchmark.storage.dfs_storage import DfsStorage
+            return DfsStorage(namespace, framework)
         else:
             raise Exception(str(ErrorCodes.EC1001))
