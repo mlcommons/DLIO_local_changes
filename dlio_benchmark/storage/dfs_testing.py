@@ -24,6 +24,10 @@ MPI ranks see what the parent wrote, which an in-memory fake cannot offer.
 
 Container paths keep the ``DfsClient`` semantics: they are absolute within
 the container, and results and exceptions have the same shape.
+
+When ``DLIO_DAOS_TEST_READ_LOG`` names a file, every ``open_read`` appends
+one line to it, the process id and the container path separated by a tab,
+so a test can see which process read which file.
 """
 
 import errno
@@ -33,6 +37,20 @@ import shutil
 import threading
 
 from dlio_benchmark.storage.dfs_client import DfsError, normalize_path
+
+TEST_READ_LOG_ENV = "DLIO_DAOS_TEST_READ_LOG"
+
+
+def _log_read(path):
+    log_path = os.environ.get(TEST_READ_LOG_ENV)
+    if not log_path:
+        return
+    line = f"{os.getpid()}\t{path}\n".encode()
+    fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
 
 
 class _DirFile(io.FileIO):
@@ -186,4 +204,5 @@ class DirBackedDfsClient:
         local = self._local(path)
         if os.path.isdir(local):
             raise IsADirectoryError(errno.EISDIR, "is a directory", normalize_path(path))
+        _log_read(normalize_path(path))
         return _DirFile(local, "r")

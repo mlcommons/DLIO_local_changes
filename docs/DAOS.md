@@ -101,6 +101,16 @@ The PyTorch data loader uses `TorchIterableDatasetSimple` for npz, npy, jpeg
 and png, and the row-group `TorchIterableDataset` for parquet, as it does
 for object storage.
 
+These datasets run on persistent DataLoader workers, which keep the
+arguments they received at start-up. So that every epoch reads that epoch's
+file list (for example after `reader.file_shuffle` reshuffled it), the main
+process publishes the list after each `reconfigure()`: to a private file
+(mode 0600, under `/dev/shm`) that each worker reads at the start of every
+iteration, or directly to the dataset when `reader.read_threads` is 0. The
+workers then shard the list as before. The file is removed when the main
+process exits normally; files left by processes that were killed are
+removed by the next run once their process no longer exists.
+
 Data generation writes every supported format through the storage backend.
 TFRecord generation writes each file to a local temporary file first and then
 copies it into the container, as it does for object storage.
@@ -210,15 +220,6 @@ and `daos_anchor_t`, were compared between the DAOS tags below.
 |---|---|
 | 2.8 | declarations compared; run with every supported format and with checkpointing |
 | 2.6 (v2.6.5.p3) | declarations compared; not run |
-
-## Known limitations
-
-- With PyTorch DataLoader workers (`reader.read_threads` > 0), the iterable
-  dataset runs on persistent workers. Each worker keeps reading the file
-  list it received when it started, also after the epoch changes and the
-  files are reshuffled. The object-store iterable path behaves the same way
-  (`persistent_workers=True`, and the file list is taken from the worker's
-  reader).
 
 ## Troubleshooting
 

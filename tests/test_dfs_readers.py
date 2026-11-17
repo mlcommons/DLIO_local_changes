@@ -464,6 +464,162 @@ def test_two_epochs_with_finalize_reuse_read_pool(reader_args, monkeypatch):
     assert reader._total_objects_read == 4
 
 
+# -- Epoch file list on persistent workers -----------------------------------
+
+
+def _installed(reader):
+    return [filename for _, filename, _ in reader.file_map[reader.thread_index]]
+
+
+def _every_other(items, start, step):
+    return [item for i, item in enumerate(items) if i % step == start]
+
+
+def _npz_loader(reader_args, monkeypatch, paths, read_threads):
+    from dlio_benchmark.data_loader.torch_data_loader import TorchDataLoader
+
+    monkeypatch.setattr(reader_args, "format", FormatType.NPZ)
+    monkeypatch.setattr(reader_args, "batch_size", 1)
+    monkeypatch.setattr(reader_args, "read_threads", read_threads)
+    monkeypatch.setattr(reader_args, "multiprocessing_context", "spawn")
+    monkeypatch.setattr(reader_args, "file_list_train", list(paths), raising=False)
+    loader = TorchDataLoader(FormatType.NPZ, DatasetType.TRAIN, 1)
+    assert loader._args is reader_args
+    loader.read()
+    return loader
+
+
+def _next_epoch(loader, files):
+    # reconfigure() installs a new list object for the next epoch; then
+    # main.py calls refresh_args().
+    loader._args.file_list_train = list(files)
+    loader.refresh_args()
+
+
+def test_daos_in_process_dataset_follows_epoch_file_list(reader_args, monkeypatch):
+    paths = _write_files([5] * 6)
+    loader = _npz_loader(reader_args, monkeypatch, paths, read_threads=0)
+    dataset = loader._dataset.dataset
+    assert len(list(iter(loader._dataset))) == 6
+    assert _installed(dataset.reader) == paths
+
+    epoch2 = list(reversed(paths))
+    _next_epoch(loader, epoch2)
+    assert len(list(iter(loader._dataset))) == 6
+    assert _installed(dataset.reader) == epoch2
+    loader.finalize()
+
+
+def test_daos_worker_dataset_follows_epoch_file_list(reader_args, monkeypatch, tmp_path):
+    """read_threads=2 (spawn, persistent workers).  A worker gets the dataset
+    pickled once when it starts and never reruns worker_init; each worker is
+    emulated here with that pickled copy."""
+    import pickle
+    from types import SimpleNamespace
+
+    import torch
+
+    paths = _write_files([5] * 6)
+    loader = _npz_loader(reader_args, monkeypatch, paths, read_threads=2)
+    dataset = loader._dataset.dataset
+    assert dataset.reader is None
+    path = dataset._daos_files_path
+    assert path is not None and os.path.exists(path)
+    assert os.stat(path).st_mode & 0o777 == 0o600
+    sent_to_workers = pickle.dumps(dataset)
+
+    epoch2 = list(reversed(paths))
+    _next_epoch(loader, epoch2)
+
+    union = []
+    for wid in range(2):
+        worker = pickle.loads(sent_to_workers)
+        info = SimpleNamespace(id=wid, num_workers=2)
+        monkeypatch.setattr(torch.utils.data, "get_worker_info", lambda info=info: info)
+        worker.worker_init(wid)
+        # Iterate twice: the second pass must also read the current list.
+        for _ in range(2):
+            batches = list(iter(worker))
+            installed = _installed(worker.reader)
+            assert installed == _every_other(epoch2, wid, 2)
+            assert installed != _every_other(paths, wid, 2)
+            assert len(batches) == len(installed)
+        union.extend(installed)
+        worker.reader.finalize()
+    assert sorted(union) == sorted(paths)
+
+    from dlio_benchmark.data_loader import torch_data_loader as tdl
+    tdl._remove_daos_files(path, os.getpid())
+    assert not os.path.exists(path)
+
+
+def test_daos_stale_file_lists_of_dead_processes_are_removed(tmp_path):
+    import subprocess
+    import sys
+
+    from dlio_benchmark.data_loader import torch_data_loader as tdl
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    dead_pid = child.pid
+    try:
+        os.kill(dead_pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        pytest.skip(f"pid {dead_pid} was reused")
+
+    dead = tmp_path / f"dlio_daos_files_{dead_pid}_train_{'a' * 32}.json"
+    dead_tmp = tmp_path / f"dlio_daos_files_{dead_pid}_train_{'a' * 32}.json.tmp"
+    mine = tmp_path / f"dlio_daos_files_{os.getpid()}_train_{'b' * 32}.json"
+    other = tmp_path / "unrelated.pkl"
+    for p in (dead, dead_tmp, mine, other):
+        p.write_bytes(b"x")
+
+    tdl._remove_stale_daos_files(str(tmp_path))
+
+    assert not dead.exists()
+    assert not dead_tmp.exists()
+    assert mine.exists()
+    assert other.exists()
+
+
+def test_daos_row_group_dataset_follows_epoch_file_list(reader_args, monkeypatch):
+    from dlio_benchmark.data_loader.torch_data_loader import (
+        TorchDataLoader, TorchIterableDataset,
+    )
+
+    pytest.importorskip("pyarrow")
+    paths = ["/data/pq/a.parquet", "/data/pq/b.parquet", "/data/pq/c.parquet"]
+    for p in paths:
+        _write_parquet(p, rows=8, row_group_size=4)
+    monkeypatch.setattr(reader_args, "format", FormatType.PARQUET)
+    monkeypatch.setattr(reader_args, "batch_size", 4)
+    monkeypatch.setattr(reader_args, "read_threads", 0)
+    monkeypatch.setattr(reader_args, "file_list_train", list(paths), raising=False)
+    loader = TorchDataLoader(FormatType.PARQUET, DatasetType.TRAIN, 1)
+    loader.read()
+    dataset = loader._dataset.dataset
+    assert isinstance(dataset, TorchIterableDataset)
+    footers = []
+    original = dataset.reader.open_footer_only
+
+    def _spy(filename):
+        footers.append(filename)
+        return original(filename)
+
+    monkeypatch.setattr(dataset.reader, "open_footer_only", _spy)
+    assert len(list(iter(loader._dataset))) == 6
+    assert footers == paths
+
+    epoch2 = [paths[2], paths[0], paths[1]]
+    _next_epoch(loader, epoch2)
+    footers.clear()
+    assert len(list(iter(loader._dataset))) == 6
+    assert footers == epoch2
+    loader.finalize()
+
+
 # -- Worker connection lifetime ------------------------------------------------
 
 _KEEP_ALIVE = []

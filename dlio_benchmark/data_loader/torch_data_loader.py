@@ -14,10 +14,14 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 """
+import atexit
 import math
 import os
+import json
 import pickle
+import tempfile
 import time
+import uuid
 import torch
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 from torch.utils.data.sampler import Sampler
@@ -171,6 +175,112 @@ def _daos_worker_init(worker_id):
     get_worker_client(*daos_connection_options(args))
 
 
+def _daos_epoch_files(dataset, worker_info):
+    """storage_type=daos: the current epoch's file list, or None.
+
+    Persistent DataLoader workers keep the dataset and arguments they
+    received when they started, so their reader's ``_file_list`` stays at
+    the first epoch's list, and the in-process reader holds a copy of the
+    arguments taken at construction.  TorchDataLoader publishes each epoch's
+    list after ``reconfigure()``: on the dataset object for in-process
+    loading, and in a file for worker processes, read here at the start of
+    every iteration.  None (other storage types) keeps the reader's list.
+    """
+    if worker_info is None:
+        files = getattr(dataset, "_daos_files", None)
+        return list(files) if files is not None else None
+    path = getattr(dataset, "_daos_files_path", None)
+    if path is None:
+        return None
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+        if os.fstat(fh.fileno()).st_uid != os.geteuid():
+            raise PermissionError(
+                f"DAOS epoch file list {path} is not owned by this user")
+        return json.load(fh)
+
+
+_DAOS_FILES_PREFIX = "dlio_daos_files_"
+_daos_stale_swept = False
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _remove_stale_daos_files(base):
+    """Remove list files left in ``base`` by processes that no longer exist.
+
+    The files are removed at normal exit only, so a run killed by a signal
+    or MPI_Abort leaves them behind; the next run cleans them up here.
+    """
+    me = os.getpid()
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(_DAOS_FILES_PREFIX):
+            continue
+        pid_text = name[len(_DAOS_FILES_PREFIX):].split("_", 1)[0]
+        if not pid_text.isdigit():
+            continue
+        pid = int(pid_text)
+        if pid == me or pid <= 0 or _pid_alive(pid):
+            continue
+        try:
+            os.remove(os.path.join(base, name))
+        except OSError:
+            pass
+
+
+def _daos_files_file(dataset_type):
+    """A private per-loader path for the published file list."""
+    global _daos_stale_swept
+    base = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+    if not _daos_stale_swept:
+        _daos_stale_swept = True
+        _remove_stale_daos_files(base)
+    kind = getattr(dataset_type, "value", dataset_type)
+    return os.path.join(
+        base, f"{_DAOS_FILES_PREFIX}{os.getpid()}_{kind}_{uuid.uuid4().hex}.json")
+
+
+def _write_daos_files(path, files):
+    """Replace ``path`` atomically with the list as JSON (mode 0600).
+
+    The temporary file is created exclusively and never through a symbolic
+    link, so a name planted in the shared directory makes this fail instead
+    of writing elsewhere.
+    """
+    tmp = f"{path}.tmp"
+    try:
+        os.remove(tmp)
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump([str(f) for f in files], fh)
+    os.replace(tmp, path)
+
+
+def _remove_daos_files(path, owner_pid):
+    if os.getpid() != owner_pid:
+        return
+    for name in (path, f"{path}.tmp"):
+        try:
+            os.remove(name)
+        except FileNotFoundError:
+            pass
+
+
 class TorchDataset(Dataset):
     """
     Currently, we only support loading one sample per file
@@ -292,8 +402,11 @@ class TorchIterableDataset(IterableDataset):
                 yield dummy
             return
 
-        # _file_list is set by FormatReader.__init__ from args.file_list_train
-        all_files = list(self.reader._file_list)
+        epoch_files = _daos_epoch_files(self, worker_info)
+        if epoch_files is None:
+            # _file_list is set by FormatReader.__init__ from args.file_list_train
+            epoch_files = list(self.reader._file_list)
+        all_files = list(epoch_files)
 
         # Shard files across workers: worker k handles files[k::num_workers]
         if worker_info is not None:
@@ -301,7 +414,7 @@ class TorchIterableDataset(IterableDataset):
 
         wid = worker_info.id if worker_info is not None else 0
         reader_type = type(self.reader).__name__
-        print(f"[ITER] worker={wid} reader={reader_type} files_this_worker={len(all_files)} total_files={len(list(self.reader._file_list))}", flush=True)
+        print(f"[ITER] worker={wid} reader={reader_type} files_this_worker={len(all_files)} total_files={len(epoch_files)}", flush=True)
 
         # ── s3dlio consumer-driven pipeline ─────────────────────────────────
         # ParquetReaderS3dlio.iter_epoch() installs the worker's file shard,
@@ -512,8 +625,10 @@ class TorchIterableDatasetSimple(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
 
         # Shard files: worker k handles every k-th file starting at offset k.
-        # _file_list = args.file_list_train, updated each epoch by reconfigure().
-        all_files = list(self.reader._file_list)
+        all_files = _daos_epoch_files(self, worker_info)
+        if all_files is None:
+            # _file_list = args.file_list_train, updated each epoch by reconfigure().
+            all_files = list(self.reader._file_list)
         if worker_info is not None:
             my_files = all_files[worker_info.id::worker_info.num_workers]
         else:
@@ -609,6 +724,7 @@ class TorchDataLoader(BaseDataLoader):
     @dlp.log_init
     def __init__(self, format_type, dataset_type, epoch_number):
         super().__init__(format_type, dataset_type, epoch_number, DataLoaderType.PYTORCH)
+        self._daos_files_path = None
 
     @dlp.log
     def read(self):
@@ -677,7 +793,10 @@ class TorchDataLoader(BaseDataLoader):
                     "NPYReaderDfsIterable"   if self.format_type is FormatType.NPY  else
                     "ImageReaderDfsIterable"
                 )
-                _sample_access = "next()->_dfs_stream_next(libdfs, ThreadPool-64) then iterate"
+                _sample_access = (
+                    f"next()->_dfs_stream_next(libdfs, in-order read-ahead "
+                    f"{_opts.get('prefetch_window', 4)}) then iterate"
+                )
             elif _st in _s3_types and _lib in _s3_libs:
                 _reader_cls = (
                     "NPZReaderS3Iterable"   if self.format_type is FormatType.NPZ  else
@@ -724,6 +843,9 @@ class TorchDataLoader(BaseDataLoader):
                 kwargs = {'multiprocessing_context': self._args.multiprocessing_context}
                 if torch.__version__ != '1.3.1':
                     kwargs['persistent_workers'] = True
+            # storage_type=daos: workers stay persistent; each epoch's file
+            # list reaches them through _daos_attach_files / refresh_args.
+            self._daos_attach_files(dataset, num_workers)
             pin_memory = self._args.pin_memory and torch.cuda.is_available()
             self._dataset = DataLoader(
                 dataset,
@@ -758,6 +880,9 @@ class TorchDataLoader(BaseDataLoader):
                 kwargs = {'multiprocessing_context': self._args.multiprocessing_context}
                 if torch.__version__ != '1.3.1':
                     kwargs['persistent_workers'] = True
+            # storage_type=daos: workers stay persistent; each epoch's file
+            # list reaches them through _daos_attach_files / refresh_args.
+            self._daos_attach_files(dataset, num_workers)
             pin_memory = self._args.pin_memory and torch.cuda.is_available()
             self._dataset = DataLoader(
                 dataset,
@@ -859,6 +984,43 @@ class TorchDataLoader(BaseDataLoader):
         dataset = self._dataset.dataset
         if hasattr(dataset, 'serial_args'):
             dataset.serial_args = pickle.dumps(self._args)
+        self._daos_publish_files(dataset)
+
+    def _daos_attach_files(self, dataset, num_workers):
+        """storage_type=daos: deliver every epoch's file list to the dataset.
+
+        The iterable datasets run on persistent workers, which never rerun
+        worker_init and so never see the arguments refresh_args() pickles
+        after reconfigure().  Instead of giving up persistence (the pre-warm
+        in main.py would then be lost and worker start-up would land inside
+        timed epochs), the list is published here and by refresh_args(): on
+        the dataset for in-process loading, and in a private file read by the
+        workers at the start of each iteration.  Other storage types keep
+        their current behaviour.
+        """
+        from dlio_benchmark.common.enumerations import StorageType
+        if self._args.storage_type != StorageType.DAOS:
+            return
+        if num_workers > 0:
+            if self._daos_files_path is None:
+                self._daos_files_path = _daos_files_file(self.dataset_type)
+                atexit.register(_remove_daos_files, self._daos_files_path, os.getpid())
+            dataset._daos_files_path = self._daos_files_path
+        self._daos_publish_files(dataset)
+
+    def _daos_publish_files(self, dataset):
+        from dlio_benchmark.common.enumerations import StorageType
+        if self._args.storage_type != StorageType.DAOS:
+            return
+        if self.dataset_type is DatasetType.TRAIN:
+            files = list(self._args.file_list_train)
+        else:
+            files = list(self._args.file_list_eval)
+        path = getattr(dataset, "_daos_files_path", None)
+        if path is not None:
+            _write_daos_files(path, files)
+        else:
+            dataset._daos_files = files
 
     @dlp.log
     def finalize(self):

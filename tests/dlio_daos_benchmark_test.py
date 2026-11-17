@@ -27,13 +27,14 @@ Run without mpirun (single rank), like tests/test_fast_ci.py.
 """
 
 import os
+from collections import defaultdict
 
 import pytest
 from hydra import initialize_config_dir, compose
 from omegaconf import OmegaConf
 
 import dlio_benchmark
-from dlio_benchmark.storage import dfs_client
+from dlio_benchmark.storage import dfs_client, dfs_testing
 from dlio_benchmark.utils.config import ConfigArguments
 from dlio_benchmark.utils.utility import DLIOMPI
 from tests.utils import TEST_TIMEOUT_SECONDS
@@ -87,7 +88,7 @@ def daos_env(tmp_path, monkeypatch):
     DLIOMPI.reset()
 
 
-def _overrides(storage_root="/", epochs=1):
+def _overrides(storage_root="/", epochs=1, num_files_train=NUM_FILES_TRAIN):
     return [
         "++workload.storage.storage_type=daos",
         f"++workload.storage.storage_root={storage_root}",
@@ -96,7 +97,7 @@ def _overrides(storage_root="/", epochs=1):
         "++workload.storage.storage_options.stagger_workers=false",
         "++workload.dataset.num_subfolders_train=0",
         "++workload.dataset.num_subfolders_eval=0",
-        f"++workload.dataset.num_files_train={NUM_FILES_TRAIN}",
+        f"++workload.dataset.num_files_train={num_files_train}",
         f"++workload.dataset.num_files_eval={NUM_FILES_EVAL}",
         f"++workload.train.epochs={epochs}",
         "++workload.train.computation_time=0.01",
@@ -221,6 +222,48 @@ def test_daos_tensorflow_tfrecord(daos_env):
     # every epoch, and each pass must cover the full file list.
     _generate_list_train_delete(container_dir, workdir, "tfrecord", "tensorflow", 2, None,
                                 epochs=2)
+
+
+@pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
+def test_daos_persistent_workers_follow_epoch_shuffle(daos_env, monkeypatch, tmp_path):
+    """file_shuffle reshuffles the file list every epoch; the persistent
+    DataLoader workers must read each epoch's list, not the first one."""
+    container_dir, workdir = daos_env
+    num_files = 16
+    read_threads = 2
+    read_log = tmp_path / "reads.log"
+    base = _overrides(epochs=2, num_files_train=num_files) + [
+        "++workload.framework=pytorch",
+        "++workload.reader.data_loader=pytorch",
+        "++workload.dataset.format=npz",
+        "++workload.dataset.data_folder=/dlio_test/npz",
+        f"++workload.reader.read_threads={read_threads}",
+        "++workload.reader.multiprocessing_context=spawn",
+        "++workload.reader.file_shuffle=seed",
+        "++workload.reader.batch_size=1",
+    ]
+    _run(base + ["++workload.workflow.generate_data=True", "++workload.workflow.train=False"])
+    _reset_singletons()
+    train_files = {f"/dlio_test/npz/train/{name}"
+                   for name in _files(container_dir, "dlio_test/npz/train", "npz")}
+    assert len(train_files) == num_files
+
+    monkeypatch.setenv(dfs_testing.TEST_READ_LOG_ENV, str(read_log))
+    _run(base + ["++workload.workflow.generate_data=False", "++workload.workflow.train=True"])
+    monkeypatch.delenv(dfs_testing.TEST_READ_LOG_ENV)
+
+    per_worker = defaultdict(set)
+    for line in read_log.read_text().splitlines():
+        pid, path = line.split("\t", 1)
+        if path in train_files:
+            per_worker[pid].add(path)
+    # Persistent workers: the same processes read every epoch.
+    assert len(per_worker) == read_threads
+    assert set().union(*per_worker.values()) == train_files
+    # Each worker reads every second file of the epoch's list.  With the
+    # first epoch's list kept, a worker would see only num_files / 2 files.
+    for pid, seen in per_worker.items():
+        assert len(seen) > num_files // read_threads, (pid, sorted(seen))
 
 
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
