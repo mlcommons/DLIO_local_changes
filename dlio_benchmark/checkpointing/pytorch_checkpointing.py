@@ -117,6 +117,8 @@ class PyTorchCheckpointing(BaseCheckpointing):
                 )
                 self._streaming_cache['daos'] = DfsStreamingCheckpointing(
                     chunk_size=32 * 1024 * 1024,
+                    num_buffers=4,
+                    num_parallel_readers=4,
                 )
             return self._streaming_cache['daos']
 

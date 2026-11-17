@@ -107,11 +107,27 @@ copies it into the container, as it does for object storage.
 
 ### Checkpointing
 
-PyTorch checkpointing (`framework: pytorch`) is supported. Each checkpoint
-file is created once and written in 32 MiB chunks at consecutive offsets;
-reading uses 32 MiB range reads. DFS writes are synchronous and DAOS has no
-client-side page cache, so no separate flush is issued. The DAOS backend is
-selected even when `mlpstorage_py` is installed.
+PyTorch checkpointing (`framework: pytorch`) is supported. The data and the
+I/O pattern follow mlpstorage's `StreamingCheckpointing`, which DLIO uses for
+`file` and `direct_fs`, with the same parameters:
+
+- Data: one dgen-py generator per checkpoint file, with `dedup_ratio=1.0`
+  and `compress_ratio=1.0` and its threads limited to the CPUs of the node
+  divided by the ranks on the node. Every chunk is fresh, incompressible
+  data. dgen-py is a dependency of DLIO; without it, saving a checkpoint
+  fails with `ImportError`.
+- Save: a producer thread fills 4 buffers of 32 MiB in turn while the
+  calling thread writes the filled buffers at consecutive offsets through
+  one write handle. The file is created once. A buffer is filled again only
+  after its write has returned. No subprocess is used, because a forked
+  process cannot reuse the DAOS client state of its parent.
+- Load: the file is split into 4 contiguous blocks of equal size (the last
+  one may be shorter). Each block is read by its own thread, through its own
+  read handle, in 128 MiB pieces (4 x the write chunk size).
+
+DFS writes are synchronous and DAOS has no client-side page cache, so no
+separate flush is issued. The DAOS backend is selected even when
+`mlpstorage_py` is installed.
 
 ### Rejected configurations
 
@@ -177,7 +193,7 @@ The DAOS tests run in the fast CI workflow:
 | `tests/test_dfs_client_binding.py` | the `ctypes` binding against a fake `libdfs` (arguments, flags, errors, short reads, directory iteration across batches) |
 | `tests/test_dfs_storage.py` | the storage backend and the pre-connect configuration check |
 | `tests/test_dfs_readers.py` | reader selection, prefetch, and worker connection lifetime |
-| `tests/test_dfs_checkpointing.py` | checkpoint backend selection, chunked writes and reads |
+| `tests/test_dfs_checkpointing.py` | checkpoint backend selection, generated data, buffer reuse, error handling, and parallel block reads |
 | `tests/dlio_daos_benchmark_test.py` | generate, list, train, and delete for every supported format, spawned workers, and checkpoint write and read through `DLIOBenchmark` |
 
 ## DAOS versions
