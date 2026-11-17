@@ -139,6 +139,7 @@ class TFRecordReaderDfsIterable(FormatReader, _DfsIterableMixin):
     @dlp.log
     def finalize(self):
         self.finalize_dfs_bytes()
+        self._dfs_shutdown()
         return super().finalize()
 
     def is_index_based(self):

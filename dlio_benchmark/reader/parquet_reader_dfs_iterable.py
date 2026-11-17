@@ -30,7 +30,9 @@ ever opened as a local file.
 
 Exposes ``open_footer_only()`` / ``submit_rg_prefetch()`` and
 ``_prefetch_executor`` so that TorchIterableDataset drives it through the
-same sliding-window path as the file and S3 readers.
+same sliding-window path as the file and S3 readers.  The executor is
+created on first use; ``finalize()`` cancels queued reads and shuts it down,
+and the next use creates a new one.
 
 Configuration (under storage.storage_options):
   prefetch_workers: 64   # range-read threads per worker process (max 64)
@@ -79,15 +81,23 @@ class ParquetReaderDfsIterable(FormatReader):
         self._dfs_client = get_client(pool, container, sys_name)
 
         max_w = max(1, min(_MAX_PREFETCH_CONCURRENCY, int(opts.get("prefetch_workers", 64))))
-        self._prefetch_executor = ThreadPoolExecutor(
-            max_workers=max_w, thread_name_prefix="rg-dfs-prefetch"
-        )
+        self._prefetch_workers = max_w
+        self._executor = None
 
         self.logger.info(
             f"{utcnow()} ParquetReaderDfsIterable "
             f"thread={thread_index} epoch={epoch} "
             f"prefetch_workers={max_w} columns={self._columns}"
         )
+
+    @property
+    def _prefetch_executor(self) -> ThreadPoolExecutor:
+        """The range-read pool, created on first use."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._prefetch_workers, thread_name_prefix="rg-dfs-prefetch"
+            )
+        return self._executor
 
     # -- I/O helpers ------------------------------------------------------------
 
@@ -200,10 +210,13 @@ class ParquetReaderDfsIterable(FormatReader):
 
     @dlp.log
     def finalize(self):
-        """Cancel outstanding reads and flush caches."""
+        """Cancel outstanding reads, shut the range-read pool down, flush caches."""
         for fut in self._prefetch_futures.values():
             fut.cancel()
         self._prefetch_futures.clear()
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         self._pf_cache.clear()
         self._rg_cache.clear()
         return super().finalize()

@@ -25,10 +25,11 @@ towards the data loaders:
    ``storage_options.prefetch_window`` (default 4) later files are being
    read or wait to be consumed.  Reads run on one thread pool per reader
    (one thread per read-ahead file, at most 64), created on first use and
-   reused for every epoch.  The byte counters cover files whose samples
-   were consumed; files read ahead and dropped by an early close are not
-   counted.  A read error surfaces when the failing file reaches the head
-   of the queue, after the files before it were consumed.
+   reused until ``finalize()`` shuts it down; the next read creates a new
+   one.  The byte counters cover files whose samples were consumed; files
+   read ahead and dropped by an early close are not counted.  A read error
+   surfaces when the failing file reaches the head of the queue, after the
+   files before it were consumed.
 2. Every file is read in full through libdfs into a preallocated buffer
    (``dfs_read`` fills it directly; no Python-side copy) and only its byte
    count is kept.  Nothing is decoded.
@@ -40,7 +41,8 @@ In DataLoader workers it is opened by ``worker_init`` and closed when the
 worker process exits.  The reader keeps no state across epochs other than
 the byte counters reset by ``finalize_dfs_bytes()`` and the idle read
 pool: each ``next()`` call reads the file list currently installed in
-``file_map``.
+``file_map``.  Closing a read-ahead generator waits for its running reads;
+reads not started yet are cancelled.
 
 Subclass from ``FormatReader`` and this mixin only; never from a local
 reader, whose open() path would treat container paths as local files.
@@ -48,7 +50,7 @@ reader, whose open() path would treat container paths as local files.
 
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -108,6 +110,17 @@ class _DfsIterableMixin:
                 max_workers=workers, thread_name_prefix="dfs_read")
         return self._dfs_read_pool
 
+    def _dfs_shutdown(self) -> None:
+        """Shut the read pool down; the next read-ahead creates a new one.
+
+        Queued reads are cancelled and the call does not wait for running
+        ones: a read-ahead generator that is closed later waits for its own
+        running reads.  Idempotent.
+        """
+        pool, self._dfs_read_pool = self._dfs_read_pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     def _dfs_readahead(self, paths: list, window: int):
         """Yield ``(path, byte_count)`` for ``paths`` in order.
 
@@ -118,6 +131,9 @@ class _DfsIterableMixin:
         failing file reaches the head of the queue, after every file before
         it has been yielded.  On close or error, queued reads are cancelled
         and running ones are waited for, so no read is in flight afterwards.
+        Each future is drained on its own: a future cancelled by
+        ``_dfs_shutdown()`` never reaches a state that ``wait()`` counts as
+        done.
         """
         pool = self._dfs_pool()
         remaining = iter(paths)
@@ -140,10 +156,11 @@ class _DfsIterableMixin:
                 refill()
                 yield path, nbytes
         finally:
-            futures = [f for _, f in pending]
-            for f in futures:
-                f.cancel()
-            wait(futures)
+            for _, f in pending:
+                if not f.cancel():
+                    # Running or finished: wait for it; its outcome is dropped
+                    # so that it cannot replace the exception being raised.
+                    f.exception()
 
     def _dfs_thread_paths(self) -> list:
         """Unique file paths of this thread's file_map, in order."""
@@ -165,7 +182,7 @@ class _DfsIterableMixin:
     def _dfs_stream_next(self):
         """In-order read-ahead of this thread's files; one yield per batch."""
         args = self._args
-        batch_size = args.batch_size
+        batch_size = self.batch_size
         num_spf = args.num_samples_per_file
         opts = getattr(args, "storage_options", {}) or {}
         window = self._dfs_window_size()

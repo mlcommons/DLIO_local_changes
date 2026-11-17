@@ -28,6 +28,8 @@ import errno
 import os
 import posixpath
 import stat
+import threading
+import time
 
 import pytest
 
@@ -562,3 +564,65 @@ def test_backing_dir_env_selects_dir_client(monkeypatch, tmp_path):
             c.read("/nope")
     finally:
         dfs_client.close_all()
+
+
+def test_close_all_waits_for_running_read_and_rejects_new_ones(monkeypatch):
+    monkeypatch.delenv(dfs_client.TEST_BACKING_DIR_ENV, raising=False)
+    monkeypatch.setattr(dfs_client, "_registry", {})
+    fake = FakeLib()
+    fake.add_dir("/d")
+    fake.add_file("/d/f", b"x" * 64)
+    events = []
+    entered = threading.Event()
+    release = threading.Event()
+    real_read = fake.dfs_read
+    real_disconnect = fake.dfs_disconnect
+
+    def _blocking_read(*a):
+        entered.set()
+        assert release.wait(30)
+        rc = real_read(*a)
+        events.append("read_done")
+        return rc
+
+    def _disconnect(*a):
+        events.append("disconnect")
+        return real_disconnect(*a)
+
+    fake.dfs_read = _blocking_read
+    fake.dfs_disconnect = _disconnect
+    monkeypatch.setattr(dfs_client, "_load_lib", lambda: fake)
+    client = dfs_client.get_client("pool0", "cont0")
+
+    result = {}
+
+    def _read():
+        try:
+            result["data"] = client.read("/d/f")
+        except BaseException as exc:  # noqa: BLE001
+            result["error"] = exc
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    assert entered.wait(10)
+    closer = threading.Thread(target=dfs_client.close_all, daemon=True)
+    closer.start()
+    deadline = time.monotonic() + 10
+    while not client._closing and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert client._closing, "close_all did not start closing the client"
+
+    with pytest.raises(OSError, match="not connected"):
+        client.read("/d/f")
+    closer.join(timeout=0.2)
+    assert closer.is_alive(), "close_all returned while a read was running"
+    assert events == []
+
+    release.set()
+    reader.join(timeout=10)
+    closer.join(timeout=10)
+    assert not closer.is_alive()
+    assert result == {"data": b"x" * 64}
+    assert events == ["read_done", "disconnect"]
+    assert fake.count("dfs_fini") == 1
+

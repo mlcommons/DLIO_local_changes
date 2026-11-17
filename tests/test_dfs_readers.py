@@ -450,18 +450,89 @@ def test_interrupt_while_head_read_runs_leaves_no_running_read(reader_args, monk
     assert reader._dfs_cache == {}
 
 
-def test_two_epochs_with_finalize_reuse_read_pool(reader_args, monkeypatch):
+def test_finalize_shuts_read_pool_down_and_reader_is_reusable(reader_args, monkeypatch):
     paths = _write_files([6] * 4)
     reader = _make_reader(FormatType.NPZ)
     _install(reader, paths)
     assert len(list(reader.next())) == 2
     pool = reader._dfs_read_pool
+    threads = list(pool._threads)
+    assert threads
     reader.finalize()
+    assert reader._dfs_read_pool is None
     assert reader._total_objects_read == 0
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive()
+    reader.finalize()  # idempotent
     _install(reader, paths)
     assert len(list(reader.next())) == 2
-    assert reader._dfs_read_pool is pool
+    assert reader._dfs_read_pool is not None
+    assert reader._dfs_read_pool is not pool
     assert reader._total_objects_read == 4
+    reader.finalize()
+
+
+def test_close_after_pool_shutdown_does_not_hang(reader_args, monkeypatch):
+    """Reads queued behind a running one are cancelled by the pool shutdown;
+    closing the suspended generator afterwards must still return."""
+    import threading
+    from dlio_benchmark.reader import _dfs_iterable_mixin as mixin_mod
+
+    monkeypatch.setattr(mixin_mod, "_MAX_PREFETCH_CONCURRENCY", 1)
+    monkeypatch.setitem(reader_args.storage_options, "prefetch_window", 8)
+    monkeypatch.setattr(reader_args, "batch_size", 1)
+    paths = _write_files([4] * 10)
+    reader = _make_reader(FormatType.NPZ)
+    _install(reader, paths)
+    started = []
+    blocked = threading.Event()
+    release = threading.Event()
+    original = reader._dfs_read_one
+
+    def _read(path):
+        started.append(path)
+        if path == paths[1]:
+            blocked.set()
+            assert release.wait(30)
+        return original(path)
+
+    monkeypatch.setattr(reader, "_dfs_read_one", _read)
+    gen = reader.next()
+    next(gen)
+    assert blocked.wait(10)
+    assert reader._dfs_read_pool._max_workers == 1
+    reader._dfs_shutdown()
+    assert reader._dfs_read_pool is None
+
+    closer = threading.Thread(target=gen.close, daemon=True)
+    closer.start()
+    closer.join(timeout=0.5)
+    assert closer.is_alive(), "close must wait for the running read"
+    release.set()
+    closer.join(timeout=10)
+    assert not closer.is_alive(), "generator close hung on cancelled reads"
+    assert started == paths[0:2]
+    assert reader._total_objects_read == 1
+
+    monkeypatch.setattr(reader, "_dfs_read_one", original)
+    _install(reader, paths)
+    assert len(list(reader.next())) == len(paths)
+    reader.finalize()
+
+
+def test_eval_reader_uses_eval_batch_size(reader_args, monkeypatch):
+    from dlio_benchmark.reader.reader_factory import ReaderFactory
+
+    monkeypatch.setattr(reader_args, "batch_size", 2)
+    monkeypatch.setattr(reader_args, "batch_size_eval", 3)
+    paths = _write_files([5] * 6, folder="/data/valid")
+    reader = ReaderFactory.get_reader(type=FormatType.NPZ, dataset_type=DatasetType.VALID,
+                                      thread_index=0, epoch_number=1)
+    assert reader.batch_size == 3
+    _install(reader, paths)
+    assert len(list(reader.next())) == 2
+    reader.finalize()
 
 
 # -- Epoch file list on persistent workers -----------------------------------
@@ -1034,3 +1105,27 @@ def test_parquet_rg_dataset_iterates_in_process(reader_args, monkeypatch):
     batches = list(iter(dataset))
     assert len(batches) == 20 // 3
     dataset.reader.finalize()
+
+
+def test_parquet_finalize_shuts_executor_down_and_reader_is_reusable(reader_args, monkeypatch):
+    path = "/data/pq/reuse.parquet"
+    _write_parquet(path, rows=10, row_group_size=4)
+    reader = _make_parquet_reader(reader_args, monkeypatch)
+    assert reader._executor is None
+    reader.open(path)
+    executor = reader._executor
+    assert executor is not None
+    for fut in list(reader._prefetch_futures.values()):
+        assert fut.result() > 0
+    threads = list(executor._threads)
+    reader.finalize()
+    assert reader._executor is None
+    assert reader._prefetch_futures == {}
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive()
+    reader.open(path)
+    assert reader._executor is not None and reader._executor is not executor
+    for fut in list(reader._prefetch_futures.values()):
+        assert fut.result() > 0
+    reader.finalize()

@@ -72,6 +72,10 @@ read or wait to be consumed.  The byte counts reported for an epoch cover
 the files whose samples were consumed; files read ahead and dropped by an
 early stop are not counted.  A read error surfaces when the failing file
 reaches the head of the queue, after the files before it were consumed.
+When a pass ends early, reads not yet started are cancelled and the pass
+waits for the running ones. The reader's read pool is shut down when the
+reader is finalized and created again on the next read; the parquet reader
+does the same with its row-group read pool.
 
 Read-ahead threads waiting in libdfs poll for completion by default and can
 keep cores busy.  Keep ranks per host x `reader.read_threads` x
@@ -202,7 +206,7 @@ The DAOS tests run in the fast CI workflow:
 |---|---|
 | `tests/test_dfs_client_binding.py` | the `ctypes` binding against a fake `libdfs` (arguments, flags, errors, short reads, directory iteration across batches) |
 | `tests/test_dfs_storage.py` | the storage backend and the pre-connect configuration check |
-| `tests/test_dfs_readers.py` | reader selection, prefetch, and worker connection lifetime |
+| `tests/test_dfs_readers.py` | reader selection, prefetch, read pool shutdown, each epoch's file list on persistent workers, and worker connection lifetime |
 | `tests/test_dfs_checkpointing.py` | checkpoint backend selection, generated data, buffer reuse, error handling, and parallel block reads |
 | `tests/dlio_daos_benchmark_test.py` | generate, list, train, and delete for every supported format, spawned workers, and checkpoint write and read through `DLIOBenchmark` |
 
