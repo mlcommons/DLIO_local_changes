@@ -18,14 +18,16 @@
 End-to-end DLIOBenchmark runs with ``storage_type: daos``.
 
 The DFS client is replaced by the directory-backed stand-in selected with
-``DLIO_DAOS_TEST_BACKING_DIR``; the variable is inherited by spawned
-DataLoader workers, so the spawn cases see the same container contents.
+``DLIO_DAOS_TEST_BACKING_DIR`` and ``DLIO_DAOS_TEST_ALLOW_STAND_IN=1``; the
+variables are inherited by spawned DataLoader workers, so the spawn cases
+see the same container contents.
 libdfs is never loaded.  Each run executes in a scratch working directory
 so that any accidental local write would be detected.
 
 Run without mpirun (single rank), like tests/test_fast_ci.py.
 """
 
+import json
 import os
 from collections import defaultdict
 
@@ -79,6 +81,7 @@ def daos_env(tmp_path, monkeypatch):
     workdir.mkdir()
     monkeypatch.chdir(workdir)
     monkeypatch.setenv(dfs_client.TEST_BACKING_DIR_ENV, str(backing))
+    monkeypatch.setenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, "1")
     monkeypatch.setattr(dfs_client, "_registry", {})
     monkeypatch.setattr(dfs_client, "_load_lib", _no_libdfs)
     _reset_singletons()
@@ -178,6 +181,8 @@ def _generate_list_train_delete(container_dir, workdir, fmt, framework, read_thr
         assert args.multiprocessing_context == "spawn"
     outputs = [p for p in (workdir / DLIO_TEST_OUTPUT_DIR).glob("*_output.json")]
     assert len(outputs) >= 1
+    summary = json.loads((workdir / DLIO_TEST_OUTPUT_DIR / "summary.json").read_text())
+    assert summary.get("daos_test_stand_in") is True
     if epochs > 1:
         expected = benchmark.steps_per_epoch
         assert expected > 0
@@ -264,6 +269,8 @@ def test_daos_persistent_workers_follow_epoch_shuffle(daos_env, monkeypatch, tmp
     # first epoch's list kept, a worker would see only num_files / 2 files.
     for pid, seen in per_worker.items():
         assert len(seen) > num_files // read_threads, (pid, sorted(seen))
+    summary = json.loads((workdir / DLIO_TEST_OUTPUT_DIR / "summary.json").read_text())
+    assert summary.get("daos_test_stand_in") is True
 
 
 @pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")

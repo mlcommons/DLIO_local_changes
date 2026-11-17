@@ -58,7 +58,9 @@ def daos_args(mpi_ready, monkeypatch, tmp_path):
     args = ConfigArguments.get_instance()
     monkeypatch.setattr(args, "storage_type", StorageType.DAOS)
     monkeypatch.setattr(args, "storage_options", {"pool": "pool0", "container": "cont0"})
+    monkeypatch.setattr(args, "daos_test_stand_in", True)
     monkeypatch.setenv(dfs_client.TEST_BACKING_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, "1")
     monkeypatch.setattr(dfs_client, "_registry", {})
     monkeypatch.setattr(dfs_client, "_load_lib", _no_libdfs)
     yield args
@@ -223,6 +225,178 @@ def test_precheck_accepts_supported_config():
                                      framework=FrameworkType.TENSORFLOW))
 
 
+def test_precheck_sets_stand_in_flag_from_environment(monkeypatch, tmp_path):
+    monkeypatch.delenv(dfs_client.TEST_BACKING_DIR_ENV, raising=False)
+    monkeypatch.delenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, raising=False)
+    args = _precheck_args()
+    check_daos_config(args)
+    assert args.daos_test_stand_in is False
+
+    monkeypatch.setenv(dfs_client.TEST_BACKING_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, "1")
+    args = _precheck_args()
+    check_daos_config(args)
+    assert args.daos_test_stand_in is True
+
+    monkeypatch.delenv(dfs_client.TEST_ALLOW_STAND_IN_ENV)
+    with pytest.raises(RuntimeError, match=dfs_client.TEST_ALLOW_STAND_IN_ENV):
+        check_daos_config(_precheck_args())
+
+
+class _FakeMPI:
+    """A DLIOMPI stand-in: each reduction adds what the other ranks
+    contribute; ``other_ranks=None`` forbids any reduction."""
+
+    def __init__(self, mpi_state, size, other_ranks=None):
+        self.mpi_state = mpi_state
+        self._size = size
+        self._other_ranks = other_ranks
+        self.sent = []
+
+    def size(self):
+        return self._size
+
+    def reduce(self, num):
+        assert self._other_ranks is not None, "no reduction expected"
+        self.sent.append(num)
+        return num + self._other_ranks[len(self.sent) - 1]
+
+
+def _use_fake_mpi(monkeypatch, other_ranks, mpi_state=None, size=2):
+    """Install a ``_FakeMPI``; ``other_ranks`` is ``[selected, invalid]``
+    contributed by the other rank of a two-rank run."""
+    from dlio_benchmark.common.enumerations import MPIState
+    from dlio_benchmark.utils.utility import DLIOMPI
+
+    if mpi_state is None:
+        mpi_state = MPIState.MPI_INITIALIZED
+    fake = _FakeMPI(mpi_state, size, other_ranks)
+    monkeypatch.setattr(DLIOMPI, "get_instance", staticmethod(lambda: fake))
+    return fake
+
+
+def _stand_in_env(monkeypatch, tmp_path, backing, allow):
+    monkeypatch.delenv(dfs_client.TEST_BACKING_DIR_ENV, raising=False)
+    monkeypatch.delenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, raising=False)
+    if backing:
+        monkeypatch.setenv(dfs_client.TEST_BACKING_DIR_ENV, str(tmp_path))
+    if allow:
+        monkeypatch.setenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, "1")
+
+
+def test_stand_in_invalid_rank_stops_valid_rank(monkeypatch, tmp_path):
+    from dlio_benchmark.storage.dfs_precheck import resolve_daos_stand_in
+
+    _stand_in_env(monkeypatch, tmp_path, backing=False, allow=False)
+    fake = _use_fake_mpi(monkeypatch, [0, 1])
+    args = _precheck_args()
+    with pytest.raises(RuntimeError, match="1 of 2 MPI ranks"):
+        resolve_daos_stand_in(args)
+    assert fake.sent == [0, 0]
+    assert not hasattr(args, "daos_test_stand_in")
+
+
+def test_stand_in_invalid_rank_joins_both_reductions(monkeypatch, tmp_path):
+    from dlio_benchmark.storage.dfs_precheck import resolve_daos_stand_in
+
+    _stand_in_env(monkeypatch, tmp_path, backing=True, allow=False)
+    fake = _use_fake_mpi(monkeypatch, [0, 0])
+    args = _precheck_args()
+    with pytest.raises(RuntimeError, match=dfs_client.TEST_ALLOW_STAND_IN_ENV) as info:
+        resolve_daos_stand_in(args)
+    assert "MPI ranks" not in str(info.value)
+    assert fake.sent == [0, 1]
+    assert not hasattr(args, "daos_test_stand_in")
+
+
+def test_stand_in_mixed_ranks_stop_rank_without_it(monkeypatch, tmp_path):
+    from dlio_benchmark.storage.dfs_precheck import resolve_daos_stand_in
+
+    _stand_in_env(monkeypatch, tmp_path, backing=False, allow=False)
+    fake = _use_fake_mpi(monkeypatch, [1, 0])
+    args = _precheck_args()
+    with pytest.raises(RuntimeError, match="does not select"):
+        resolve_daos_stand_in(args)
+    assert fake.sent == [0, 0]
+    assert not hasattr(args, "daos_test_stand_in")
+
+
+def test_stand_in_mixed_ranks_stop_rank_with_it(monkeypatch, tmp_path):
+    from dlio_benchmark.storage.dfs_precheck import resolve_daos_stand_in
+
+    _stand_in_env(monkeypatch, tmp_path, backing=True, allow=True)
+    fake = _use_fake_mpi(monkeypatch, [0, 0])
+    args = _precheck_args()
+    with pytest.raises(RuntimeError, match="this rank selects"):
+        resolve_daos_stand_in(args)
+    assert fake.sent == [1, 0]
+    assert not hasattr(args, "daos_test_stand_in")
+
+
+def test_stand_in_flag_agreed_across_ranks(monkeypatch, tmp_path):
+    from dlio_benchmark.storage.dfs_precheck import resolve_daos_stand_in
+
+    _stand_in_env(monkeypatch, tmp_path, backing=True, allow=True)
+    fake = _use_fake_mpi(monkeypatch, [1, 0])
+    args = _precheck_args()
+    resolve_daos_stand_in(args)
+    assert args.daos_test_stand_in is True
+    assert fake.sent == [1, 0]
+
+    _stand_in_env(monkeypatch, tmp_path, backing=False, allow=False)
+    fake = _use_fake_mpi(monkeypatch, [0, 0])
+    args = _precheck_args()
+    resolve_daos_stand_in(args)
+    assert args.daos_test_stand_in is False
+    assert fake.sent == [0, 0]
+
+
+@pytest.mark.parametrize("state_name, size", [
+    ("UNINITIALIZED", 4),
+    ("CHILD_INITIALIZED", 4),
+    ("MPI_INITIALIZED", 1),
+])
+def test_stand_in_no_reduction_outside_multi_rank_mpi(monkeypatch, tmp_path,
+                                                       state_name, size):
+    from dlio_benchmark.common.enumerations import MPIState
+    from dlio_benchmark.storage.dfs_precheck import resolve_daos_stand_in
+
+    state = getattr(MPIState, state_name)
+
+    _stand_in_env(monkeypatch, tmp_path, backing=True, allow=True)
+    fake = _use_fake_mpi(monkeypatch, None, mpi_state=state, size=size)
+    args = _precheck_args()
+    resolve_daos_stand_in(args)
+    assert args.daos_test_stand_in is True
+    assert fake.sent == []
+
+    _stand_in_env(monkeypatch, tmp_path, backing=False, allow=False)
+    fake = _use_fake_mpi(monkeypatch, None, mpi_state=state, size=size)
+    args = _precheck_args()
+    resolve_daos_stand_in(args)
+    assert args.daos_test_stand_in is False
+    assert fake.sent == []
+
+
+def test_connection_options_reject_stand_in_mismatch(monkeypatch, tmp_path):
+    from dlio_benchmark.storage.dfs_precheck import daos_connection_options
+
+    monkeypatch.setenv(dfs_client.TEST_BACKING_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, "1")
+    assert daos_connection_options(_precheck_args(daos_test_stand_in=True)) == \
+        ("pool0", "cont0", None)
+    with pytest.raises(RuntimeError, match="daos_test_stand_in"):
+        daos_connection_options(_precheck_args(daos_test_stand_in=False))
+    with pytest.raises(RuntimeError, match="daos_test_stand_in"):
+        daos_connection_options(_precheck_args())
+
+    monkeypatch.delenv(dfs_client.TEST_BACKING_DIR_ENV)
+    with pytest.raises(RuntimeError, match="daos_test_stand_in"):
+        daos_connection_options(_precheck_args(daos_test_stand_in=True))
+    assert daos_connection_options(_precheck_args(daos_test_stand_in=False)) == \
+        ("pool0", "cont0", None)
+
+
 def test_precheck_ignores_other_storage_types():
     check_daos_config(_precheck_args(storage_type=StorageType.LOCAL_FS,
                                      storage_options=None, format=FormatType.HDF5,
@@ -326,3 +500,59 @@ def test_daos_promotes_fork_to_spawn():
     assert local.multiprocessing_context == "fork"
 
     assert "self._apply_daos_spawn_policy()" in inspect.getsource(config_mod)
+
+
+# -- dlio_postprocessor ------------------------------------------------------
+
+
+def _postprocessor_args(output_folder):
+    from collections import namedtuple
+
+    args = {
+        'output_folder': str(output_folder),
+        'name': '',
+        'num_proc': 2,
+        'epochs': 2,
+        'do_eval': False,
+        'do_checkpoint': False,
+        'batch_size': 4,
+        'batch_size_eval': 1,
+        'record_size': 234560851,
+    }
+    return namedtuple('args', args.keys())(*args.values())
+
+
+def _copy_postprocessor_data(tmp_path, mark=None):
+    import json
+    import shutil
+    from pathlib import Path
+
+    folder = tmp_path / "output"
+    shutil.copytree(Path(__file__).resolve().parent / "test_data", folder)
+    if mark is not None:
+        summary_path = folder / "summary.json"
+        summary = json.loads(summary_path.read_text())
+        summary["daos_test_stand_in"] = mark
+        summary_path.write_text(json.dumps(summary))
+    return folder
+
+
+def test_postprocessor_refuses_stand_in_summary(tmp_path):
+    postprocessor = pytest.importorskip("dlio_benchmark.postprocessor")
+
+    folder = _copy_postprocessor_data(tmp_path, mark=True)
+    with pytest.raises(RuntimeError, match="daos_test_stand_in"):
+        postprocessor.DLIOPostProcessor(_postprocessor_args(folder))
+    assert list(folder.glob("DLIO*report.txt")) == []
+
+
+def test_postprocessor_accepts_unmarked_summary(tmp_path):
+    postprocessor = pytest.importorskip("dlio_benchmark.postprocessor")
+
+    folder = _copy_postprocessor_data(tmp_path)
+    postproc = postprocessor.DLIOPostProcessor(_postprocessor_args(folder))
+    postproc.process_loading_and_processing_times()
+    assert postproc.overall_stats['samples/s']['mean'] == '5.10'
+
+    folder = _copy_postprocessor_data(tmp_path / "false_mark", mark=False)
+    postprocessor.DLIOPostProcessor(_postprocessor_args(folder))

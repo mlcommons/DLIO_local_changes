@@ -192,6 +192,9 @@ class ConfigArguments:
     storage_root: str = "./"
     storage_type: StorageType = StorageType.LOCAL_FS
     storage_options: Optional[Dict[str, str]] = None
+    # storage_type=daos: True when the test stand-in serves the run (set by
+    # dfs_precheck.check_daos_config); recorded in summary.json.
+    daos_test_stand_in: bool = False
     post_generation_settle_seconds: float = 0.0
     record_length: int = 64 * 1024
     record_length_stdev: int = 0

@@ -402,6 +402,8 @@ def test_default_client_resolves_checkpoint_inside_container(monkeypatch, tmp_pa
     _fake_dgen(monkeypatch)
     args = ConfigArguments.get_instance()
     monkeypatch.setenv(dfs_client.TEST_BACKING_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, "1")
+    monkeypatch.setattr(args, "daos_test_stand_in", True)
     monkeypatch.setattr(dfs_client, "_registry", {})
     monkeypatch.setattr(dfs_client, "_load_lib", _no_libdfs)
     monkeypatch.setattr(args, "storage_type", StorageType.DAOS)

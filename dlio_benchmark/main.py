@@ -157,6 +157,10 @@ class DLIOBenchmark(object):
         # Configure the logging library
         self.args.configure_dlio_logging(is_child=False)
         self.logger = DLIOLogger.get_instance()
+        if self.my_rank == 0 and getattr(self.args, "daos_test_stand_in", False):
+            self.logger.warning(
+                "storage_type daos is served by a local directory stand-in "
+                "(DLIO_DAOS_TEST_BACKING_DIR); results are not DAOS measurements")
 
         if dftracer_initialize:
             dftracer = self.args.configure_dftracer(is_child=False, use_pid=False)

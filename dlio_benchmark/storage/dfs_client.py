@@ -59,10 +59,12 @@ __all__ = [
     "get_client",
     "get_worker_client",
     "close_all",
+    "stand_in_dir",
 ]
 
 _LIBDFS_NAME = "libdfs.so"
 TEST_BACKING_DIR_ENV = "DLIO_DAOS_TEST_BACKING_DIR"
+TEST_ALLOW_STAND_IN_ENV = "DLIO_DAOS_TEST_ALLOW_STAND_IN"
 
 _FILE_MODE = stat.S_IFREG | 0o644
 _DIR_MODE = 0o755
@@ -835,18 +837,37 @@ _registry_lock = threading.Lock()
 _exit_hook_pid = None
 
 
+def stand_in_dir():
+    """The backing directory of the test stand-in, or ``None`` for DAOS.
+
+    The stand-in is used only when both ``DLIO_DAOS_TEST_BACKING_DIR`` and
+    ``DLIO_DAOS_TEST_ALLOW_STAND_IN=1`` are set.  The first variable alone
+    raises ``RuntimeError``, so a leftover test setting cannot turn a
+    measurement into a local-directory run.
+    """
+    backing = os.environ.get(TEST_BACKING_DIR_ENV) or None
+    if backing is None:
+        return None
+    if os.environ.get(TEST_ALLOW_STAND_IN_ENV) != "1":
+        raise RuntimeError(
+            f"{TEST_BACKING_DIR_ENV} is set but {TEST_ALLOW_STAND_IN_ENV}=1 is not. "
+            f"The directory stand-in for storage_type daos is for DLIO's own tests "
+            f"and needs both variables; unset {TEST_BACKING_DIR_ENV} to use DAOS.")
+    return backing
+
+
 def get_client(pool: str, container: str, sys_name=None):
     """The connected client of this process for (pool, container, sys_name).
 
-    When ``DLIO_DAOS_TEST_BACKING_DIR`` is set, a directory-backed stand-in
-    rooted at ``<dir>/<pool>/<container>`` is returned instead and libdfs is
-    never loaded.
+    When ``stand_in_dir()`` selects the test stand-in, a directory-backed
+    client rooted at ``<dir>/<pool>/<container>`` is returned instead and
+    libdfs is never loaded.
     """
     if not pool:
         raise ValueError("DAOS pool is required (storage.storage_options.pool)")
     if not container:
         raise ValueError("DAOS container is required (storage.storage_options.container)")
-    backing = os.environ.get(TEST_BACKING_DIR_ENV) or None
+    backing = stand_in_dir()
     key = (os.getpid(), str(pool), str(container), sys_name or None, backing)
     with _registry_lock:
         client = _registry.get(key)

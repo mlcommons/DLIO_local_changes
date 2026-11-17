@@ -542,6 +542,7 @@ def test_backing_dir_env_selects_dir_client(monkeypatch, tmp_path):
     from dlio_benchmark.storage.dfs_testing import DirBackedDfsClient
 
     monkeypatch.setenv(dfs_client.TEST_BACKING_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, "1")
     monkeypatch.setattr(dfs_client, "_registry", {})
 
     def _no_libdfs():
@@ -564,6 +565,24 @@ def test_backing_dir_env_selects_dir_client(monkeypatch, tmp_path):
             c.read("/nope")
     finally:
         dfs_client.close_all()
+
+
+def test_backing_dir_alone_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv(dfs_client.TEST_BACKING_DIR_ENV, str(tmp_path))
+    monkeypatch.delenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, raising=False)
+    monkeypatch.setattr(dfs_client, "_registry", {})
+
+    def _no_libdfs():
+        raise AssertionError("libdfs must not be loaded")
+
+    monkeypatch.setattr(dfs_client, "_load_lib", _no_libdfs)
+    for allow in (None, "0", "yes"):
+        if allow is not None:
+            monkeypatch.setenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, allow)
+        with pytest.raises(RuntimeError, match=dfs_client.TEST_ALLOW_STAND_IN_ENV):
+            dfs_client.get_client("pool0", "cont0")
+    assert dfs_client._registry == {}
+    assert not (tmp_path / "pool0").exists()
 
 
 def test_close_all_waits_for_running_read_and_rejects_new_ones(monkeypatch):

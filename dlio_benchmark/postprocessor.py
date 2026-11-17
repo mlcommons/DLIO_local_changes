@@ -73,6 +73,12 @@ class DLIOPostProcessor:
         '''
         with open(os.path.join(self.outdir, 'summary.json'), 'r') as summary_file:
             self.summary = json.load(summary_file)
+        if self.summary.get('daos_test_stand_in'):
+            raise RuntimeError(
+                f"{os.path.join(self.outdir, 'summary.json')} records "
+                "daos_test_stand_in: storage_type daos was served by the "
+                "local directory test stand-in, so these are not DAOS "
+                "measurements. No report is generated.")
 
         # All files are present, load some in
         try:

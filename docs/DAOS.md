@@ -180,16 +180,22 @@ suppress the message.
 
 ## Testing without DAOS
 
-Setting the environment variable `DLIO_DAOS_TEST_BACKING_DIR` to a local
-directory replaces the DAOS client with a directory-backed stand-in:
-container `<container>` of pool `<pool>` becomes the directory
+DLIO's own tests replace the DAOS client with a directory-backed stand-in.
+It is used only when both environment variables are set:
+`DLIO_DAOS_TEST_BACKING_DIR` names a local directory and
+`DLIO_DAOS_TEST_ALLOW_STAND_IN=1` confirms the choice. Container
+`<container>` of pool `<pool>` then becomes the directory
 `$DLIO_DAOS_TEST_BACKING_DIR/<pool>/<container>`, and `libdfs.so` is never
-loaded. Because the stand-in is selected by an environment variable and
-keeps its data on disk, spawned DataLoader workers and MPI ranks see the
-same container contents as the main process.
+loaded. If only `DLIO_DAOS_TEST_BACKING_DIR` is set, the run stops with an
+error before connecting. Under MPI, when any rank has an invalid
+environment or the ranks do not all make the same choice, the run stops on
+every rank. Because the stand-in is selected by environment
+variables and keeps its data on disk, spawned DataLoader workers and MPI
+ranks see the same container contents as the main process.
 
 ```bash
 export DLIO_DAOS_TEST_BACKING_DIR=/tmp/daos-backing
+export DLIO_DAOS_TEST_ALLOW_STAND_IN=1
 dlio_benchmark workload=unet3d_h100 \
   ++workload.storage.storage_type=daos \
   ++workload.storage.storage_root=/ \
@@ -198,7 +204,16 @@ dlio_benchmark workload=unet3d_h100 \
   ++workload.workflow.generate_data=True ++workload.workflow.train=False
 ```
 
-The variable is meant for tests only; never set it for a measurement.
+The stand-in is meant for tests only; never use it for a measurement. A run
+served by it is marked:
+
+- rank 0 logs a warning at start that the results are not DAOS
+  measurements;
+- `summary.json` gets the top-level field `"daos_test_stand_in": true`;
+- `dlio_postprocessor` refuses to write a report for such an output folder.
+
+The decision is made once per run, before any DataLoader worker starts, and
+every rank and worker checks that its own environment matches it.
 
 The DAOS tests run in the fast CI workflow:
 
@@ -208,7 +223,7 @@ The DAOS tests run in the fast CI workflow:
 | `tests/test_dfs_storage.py` | the storage backend and the pre-connect configuration check |
 | `tests/test_dfs_readers.py` | reader selection, prefetch, read pool shutdown, each epoch's file list on persistent workers, and worker connection lifetime |
 | `tests/test_dfs_checkpointing.py` | checkpoint backend selection, generated data, buffer reuse, error handling, and parallel block reads |
-| `tests/dlio_daos_benchmark_test.py` | generate, list, train, and delete for every supported format, spawned workers, and checkpoint write and read through `DLIOBenchmark` |
+| `tests/dlio_daos_benchmark_test.py` | generate, list, train, and delete for every supported format, spawned workers, reshuffled epochs on persistent workers, the stand-in mark in `summary.json`, and checkpoint write and read through `DLIOBenchmark` |
 
 ## DAOS versions
 

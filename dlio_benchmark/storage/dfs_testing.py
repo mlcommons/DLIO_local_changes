@@ -18,9 +18,10 @@
 A directory-backed stand-in for ``DfsClient``, for tests without DAOS.
 
 ``get_client()`` returns a ``DirBackedDfsClient`` rooted at
-``$DLIO_DAOS_TEST_BACKING_DIR/<pool>/<container>`` when that variable is set.
-Because the data lives in a real directory, spawned DataLoader workers and
-MPI ranks see what the parent wrote, which an in-memory fake cannot offer.
+``$DLIO_DAOS_TEST_BACKING_DIR/<pool>/<container>`` when that variable and
+``DLIO_DAOS_TEST_ALLOW_STAND_IN=1`` are both set.  Because the data lives in
+a real directory, spawned DataLoader workers and MPI ranks see what the
+parent wrote, which an in-memory fake cannot offer.
 
 Container paths keep the ``DfsClient`` semantics: they are absolute within
 the container, and results and exceptions have the same shape.

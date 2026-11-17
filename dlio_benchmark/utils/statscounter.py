@@ -65,6 +65,9 @@ class StatsCounter(object):
         self.summary['host_cpu_count'] = psutil.cpu_count()
         self.summary['host_processor_name'] = platform.processor()
         self.summary['potential_caching'] = False
+        if getattr(self.args, 'daos_test_stand_in', False):
+            # storage_type=daos served by the local test stand-in: not a DAOS measurement.
+            self.summary['daos_test_stand_in'] = True
 
         if os.path.exists("/proc/cpuinfo"):
             self.summary['host_cpuinfo'] = lines_to_dict(open("/proc/cpuinfo", "r").read())

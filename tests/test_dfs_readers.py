@@ -57,9 +57,11 @@ def reader_args(monkeypatch, tmp_path):
     DLIOMPI.get_instance().initialize()
     args = ConfigArguments.get_instance()
     monkeypatch.setenv(dfs_client.TEST_BACKING_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(dfs_client.TEST_ALLOW_STAND_IN_ENV, "1")
     monkeypatch.setattr(dfs_client, "_registry", {})
     monkeypatch.setattr(dfs_client, "_load_lib", _no_libdfs)
     monkeypatch.setattr(args, "storage_type", StorageType.DAOS)
+    monkeypatch.setattr(args, "daos_test_stand_in", True)
     monkeypatch.setattr(args, "storage_options",
                         {"pool": POOL, "container": CONT, "stagger_workers": "false"})
     monkeypatch.setattr(args, "data_loader", DataLoaderType.PYTORCH)
@@ -699,6 +701,7 @@ _KEEP_ALIVE = []
 def _worker_child(mode, backing_dir, log_path):
     """Body of a spawned worker: open the worker client, then exit by ``mode``."""
     os.environ[dfs_client.TEST_BACKING_DIR_ENV] = backing_dir
+    os.environ[dfs_client.TEST_ALLOW_STAND_IN_ENV] = "1"
     from dlio_benchmark.storage import dfs_testing
 
     def _log(line):
